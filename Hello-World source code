@@ -1,26 +1,124 @@
-/*
-  Blink
-*/
+// MPU6050 accel→LEDs with gravity removal + hysteresis + magnitude + hold-time
+// D6 = X fast, D7 = Y fast, D8 = Z fast
 
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Wire.h>
+#include <math.h>
 
-// the setup function runs once when you press reset or power the board
+Adafruit_MPU6050 mpu;
+
+// ----- CONFIG -----
+const int LED_X = 6;
+const int LED_Y = 7;
+const int LED_Z = 8;
+
+// Linear acceleration thresholds (after gravity removal)
+const float THRESH_ON  = 1.2f;   // ~0.12 g — moderate hand shake
+const float THRESH_OFF = 0.8f;   // hysteresis
+float alpha = 0.95f;             // a bit faster (less smoothing)
+
+const uint16_t HOLD_MS = 150;    // keep LEDs on briefly so they're visible
+
+// Gravity estimate
+bool g_init = false;
+float gX = 0, gY = 0, gZ = 0;
+
+// LED states + hold timers
+bool x_on = false, y_on = false, z_on = false;
+unsigned long tX = 0, tY = 0, tZ = 0;
+
 void setup() {
-  // initialize digital pin LED_BUILTIN as an output.
-  pinMode(8, OUTPUT);
-  pinMode(9, INPUT);
+  pinMode(LED_X, OUTPUT);
+  pinMode(LED_Y, OUTPUT);
+  pinMode(LED_Z, OUTPUT);
+  digitalWrite(LED_X, LOW);
+  digitalWrite(LED_Y, LOW);
+  digitalWrite(LED_Z, LOW);
+
+  delay(150);
+
+  digitalWrite(LED_X, HIGH);
+  digitalWrite(LED_Y, HIGH);
+  digitalWrite(LED_Z, HIGH);
+
+  delay(150);
+
+  digitalWrite(LED_X, LOW);
+  digitalWrite(LED_Y, LOW);
+  digitalWrite(LED_Z, LOW);
+
+  Serial.begin(115200);
+  // IMPORTANT on bare ATmega328P: do NOT wait for Serial
+  // while (!Serial) delay(10);
+
+  if (!mpu.begin()) {
+    // If you don't see this on Serial, LEDs will flash rapidly to indicate error
+    for (;;) {
+      digitalWrite(LED_X, !digitalRead(LED_X));
+      digitalWrite(LED_Y, !digitalRead(LED_Y));
+      digitalWrite(LED_Z, !digitalRead(LED_Z));
+      delay(150);
+    }
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  delay(100);
+
+  Serial.println("MPU6050 linear-accel LED demo (moderate shake tuned)");
 }
 
-// the loop function runs over and over again forever
 void loop() {
-  int buttonState = digitalRead(9);
-  if (buttonState == HIGH) {
-      digitalWrite(8, HIGH);
-      delay(1000); 
-      digitalWrite(8, LOW);
-      delay(1000);
-    } else {
-   digitalWrite(8, LOW);
-  }
-}     
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
 
-//Ian
+  if (!g_init) {
+    gX = a.acceleration.x;
+    gY = a.acceleration.y;
+    gZ = a.acceleration.z;
+    g_init = true;
+  }
+
+  // Low-pass to estimate gravity
+  gX = alpha * gX + (1.0f - alpha) * a.acceleration.x;
+  gY = alpha * gY + (1.0f - alpha) * a.acceleration.y;
+  gZ = alpha * gZ + (1.0f - alpha) * a.acceleration.z;
+
+  // Linear acceleration = raw - gravity
+  float lx = a.acceleration.x - gX;
+  float ly = a.acceleration.y - gY;
+  float lz = a.acceleration.z - gZ;
+
+  float ax = fabs(lx);
+  float ay = fabs(ly);
+  float az = fabs(lz);
+  float amag = sqrt(lx*lx + ly*ly + lz*lz); // overall shake magnitude
+
+  // Per-axis hysteresis + hold
+  unsigned long now = millis();
+  if (!x_on && ax > THRESH_ON) { x_on = true; tX = now; }
+  if (x_on  && (ax < THRESH_OFF) && (now - tX > HOLD_MS)) x_on = false;
+
+  if (!y_on && ay > THRESH_ON) { y_on = true; tY = now; }
+  if (y_on  && (ay < THRESH_OFF) && (now - tY > HOLD_MS)) y_on = false;
+
+  if (!z_on && az > THRESH_ON) { z_on = true; tZ = now; }
+  if (z_on  && (az < THRESH_OFF) && (now - tZ > HOLD_MS)) z_on = false;
+
+  // Drive LEDs
+  digitalWrite(LED_X, x_on ? HIGH : LOW);
+  digitalWrite(LED_Y, y_on ? HIGH : LOW);
+  digitalWrite(LED_Z, z_on ? HIGH : LOW);
+
+  // Optional: also flash all LEDs on overall shake magnitude
+  // if (amag > 1.5f) { digitalWrite(LED_X,HIGH); digitalWrite(LED_Y,HIGH); digitalWrite(LED_Z,HIGH); }
+
+  // Debug
+  Serial.print("Lin (m/s^2) X:"); Serial.print(lx,2);
+  Serial.print(" Y:");             Serial.print(ly,2);
+  Serial.print(" Z:");             Serial.print(lz,2);
+  Serial.print(" | |a|:");         Serial.println(amag,2);
+
+  delay(20); // quicker loop for more responsive detection
+}
