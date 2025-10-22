@@ -1,124 +1,126 @@
-// MPU6050 accel→LEDs with gravity removal + hysteresis + magnitude + hold-time
-// D6 = X fast, D7 = Y fast, D8 = Z fast
+// Two MPU6050 accel→LEDs with gravity removal + hysteresis + magnitude + hold-time
+// MPU A -> LEDs D6/D7/D8;  MPU B -> LEDs D9/D10/D11
 
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <Wire.h>
 #include <math.h>
 
-Adafruit_MPU6050 mpu;
+// ----- SENSORS -----
+Adafruit_MPU6050 mpuA;   // address 0x68 (AD0=GND)
+Adafruit_MPU6050 mpuB;   // address 0x69 (AD0=VCC)
 
 // ----- CONFIG -----
-const int LED_X = 6;
-const int LED_Y = 7;
-const int LED_Z = 8;
+// const int LEDA_X = 6,  LEDA_Y = 7,  LEDA_Z = 8;   // LEDs for sensor A
+// const int LEDB_X = 3,  LEDB_Y = 4, LEDB_Z = 5;  // LEDs for sensor B
 
 // Linear acceleration thresholds (after gravity removal)
 const float THRESH_ON  = 1.2f;   // ~0.12 g — moderate hand shake
 const float THRESH_OFF = 0.8f;   // hysteresis
-float alpha = 0.95f;             // a bit faster (less smoothing)
+float alpha = 0.95f;             // gravity LPF factor
 
 const uint16_t HOLD_MS = 150;    // keep LEDs on briefly so they're visible
 
-// Gravity estimate
-bool g_init = false;
-float gX = 0, gY = 0, gZ = 0;
+// Per-sensor gravity estimate/state
+struct GravState {
+  bool g_init = false;
+  float gx = 0, gy = 0, gz = 0;
+  bool x_on = false, y_on = false, z_on = false;
+  unsigned long tX = 0, tY = 0, tZ = 0;
+};
+GravState sA, sB;
 
-// LED states + hold timers
-bool x_on = false, y_on = false, z_on = false;
-unsigned long tX = 0, tY = 0, tZ = 0;
-
-void setup() {
-  pinMode(LED_X, OUTPUT);
-  pinMode(LED_Y, OUTPUT);
-  pinMode(LED_Z, OUTPUT);
-  digitalWrite(LED_X, LOW);
-  digitalWrite(LED_Y, LOW);
-  digitalWrite(LED_Z, LOW);
-
+// ---------- helpers ----------
+void ledInit() {
+  int pins[] = {LEDA_X, LEDA_Y, LEDA_Z, LEDB_X, LEDB_Y, LEDB_Z};
+  for (int p : pins) { pinMode(p, OUTPUT); digitalWrite(p, LOW); }
   delay(150);
-
-  digitalWrite(LED_X, HIGH);
-  digitalWrite(LED_Y, HIGH);
-  digitalWrite(LED_Z, HIGH);
-
+  for (int p : pins) digitalWrite(p, HIGH);
   delay(150);
+  for (int p : pins) digitalWrite(p, LOW);
+}
 
-  digitalWrite(LED_X, LOW);
-  digitalWrite(LED_Y, LOW);
-  digitalWrite(LED_Z, LOW);
-
-  Serial.begin(115200);
-  // IMPORTANT on bare ATmega328P: do NOT wait for Serial
-  // while (!Serial) delay(10);
-
-  if (!mpu.begin()) {
-    // If you don't see this on Serial, LEDs will flash rapidly to indicate error
-    for (;;) {
-      digitalWrite(LED_X, !digitalRead(LED_X));
-      digitalWrite(LED_Y, !digitalRead(LED_Y));
-      digitalWrite(LED_Z, !digitalRead(LED_Z));
-      delay(150);
-    }
-  }
+bool beginMPU(Adafruit_MPU6050 &mpu, uint8_t addr) {
+  if (!mpu.begin(addr)) return false;
   mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
   mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-  delay(100);
-
-  Serial.println("MPU6050 linear-accel LED demo (moderate shake tuned)");
+  return true;
 }
 
-void loop() {
+// Process one sensor: read, remove gravity, apply hysteresis/hold, drive its LEDs
+void processOne(Adafruit_MPU6050 &mpu, GravState &st, int Lx, int Ly, int Lz, const char *tag) {
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
 
-  if (!g_init) {
-    gX = a.acceleration.x;
-    gY = a.acceleration.y;
-    gZ = a.acceleration.z;
-    g_init = true;
+  if (!st.g_init) {
+    st.gx = a.acceleration.x; st.gy = a.acceleration.y; st.gz = a.acceleration.z;
+    st.g_init = true;
   }
 
   // Low-pass to estimate gravity
-  gX = alpha * gX + (1.0f - alpha) * a.acceleration.x;
-  gY = alpha * gY + (1.0f - alpha) * a.acceleration.y;
-  gZ = alpha * gZ + (1.0f - alpha) * a.acceleration.z;
+  st.gx = alpha * st.gx + (1.0f - alpha) * a.acceleration.x;
+  st.gy = alpha * st.gy + (1.0f - alpha) * a.acceleration.y;
+  st.gz = alpha * st.gz + (1.0f - alpha) * a.acceleration.z;
 
-  // Linear acceleration = raw - gravity
-  float lx = a.acceleration.x - gX;
-  float ly = a.acceleration.y - gY;
-  float lz = a.acceleration.z - gZ;
+  // Linear acceleration
+  float lx = a.acceleration.x - st.gx;
+  float ly = a.acceleration.y - st.gy;
+  float lz = a.acceleration.z - st.gz;
 
-  float ax = fabs(lx);
-  float ay = fabs(ly);
-  float az = fabs(lz);
-  float amag = sqrt(lx*lx + ly*ly + lz*lz); // overall shake magnitude
+  float ax = fabs(lx), ay = fabs(ly), az = fabs(lz);
+  float amag = sqrt(lx*lx + ly*ly + lz*lz);
 
   // Per-axis hysteresis + hold
   unsigned long now = millis();
-  if (!x_on && ax > THRESH_ON) { x_on = true; tX = now; }
-  if (x_on  && (ax < THRESH_OFF) && (now - tX > HOLD_MS)) x_on = false;
+  if (!st.x_on && ax > THRESH_ON) { st.x_on = true; st.tX = now; }
+  if ( st.x_on && (ax < THRESH_OFF) && (now - st.tX > HOLD_MS)) st.x_on = false;
 
-  if (!y_on && ay > THRESH_ON) { y_on = true; tY = now; }
-  if (y_on  && (ay < THRESH_OFF) && (now - tY > HOLD_MS)) y_on = false;
+  if (!st.y_on && ay > THRESH_ON) { st.y_on = true; st.tY = now; }
+  if ( st.y_on && (ay < THRESH_OFF) && (now - st.tY > HOLD_MS)) st.y_on = false;
 
-  if (!z_on && az > THRESH_ON) { z_on = true; tZ = now; }
-  if (z_on  && (az < THRESH_OFF) && (now - tZ > HOLD_MS)) z_on = false;
+  if (!st.z_on && az > THRESH_ON) { st.z_on = true; st.tZ = now; }
+  if ( st.z_on && (az < THRESH_OFF) && (now - st.tZ > HOLD_MS)) st.z_on = false;
 
-  // Drive LEDs
-  digitalWrite(LED_X, x_on ? HIGH : LOW);
-  digitalWrite(LED_Y, y_on ? HIGH : LOW);
-  digitalWrite(LED_Z, z_on ? HIGH : LOW);
+  // Drive LEDs for this sensor
+  digitalWrite(Lx, st.x_on ? HIGH : LOW);
+  digitalWrite(Ly, st.y_on ? HIGH : LOW);
+  digitalWrite(Lz, st.z_on ? HIGH : LOW);
 
-  // Optional: also flash all LEDs on overall shake magnitude
-  // if (amag > 1.5f) { digitalWrite(LED_X,HIGH); digitalWrite(LED_Y,HIGH); digitalWrite(LED_Z,HIGH); }
+  // Debug (prefix with sensor tag)
+  Serial.print(tag); Serial.print(" Lin X:"); Serial.print(lx,2);
+  Serial.print(" Y:");  Serial.print(ly,2);
+  Serial.print(" Z:");  Serial.print(lz,2);
+  Serial.print(" | |a|:"); Serial.println(amag,2);
+}
 
-  // Debug
-  Serial.print("Lin (m/s^2) X:"); Serial.print(lx,2);
-  Serial.print(" Y:");             Serial.print(ly,2);
-  Serial.print(" Z:");             Serial.print(lz,2);
-  Serial.print(" | |a|:");         Serial.println(amag,2);
+void setup() {
+  Serial.begin(115200);
+  // while (!Serial) delay(10); // keep disabled for bare 328P
+  ledInit();
 
-  delay(20); // quicker loop for more responsive detection
+  // I2C
+  Wire.begin();
+
+  // Start both MPUs (A:0x68, B:0x69)
+  if (!beginMPU(mpuA, 0x68) || !beginMPU(mpuB, 0x69)) {
+    // flash all LEDs rapidly on error
+    for (;;) {
+      digitalWrite(LEDA_X, !digitalRead(LEDA_X));
+      digitalWrite(LEDA_Y, !digitalRead(LEDA_Y));
+      digitalWrite(LEDA_Z, !digitalRead(LEDA_Z));
+      digitalWrite(LEDB_X, !digitalRead(LEDB_X));
+      digitalWrite(LEDB_Y, !digitalRead(LEDB_Y));
+      digitalWrite(LEDB_Z, !digitalRead(LEDB_Z));
+      delay(150);
+    }
+  }
+  delay(100);
+  Serial.println("Dual MPU6050 linear-accel LED demo");
+}
+
+void loop() {
+  processOne(mpuA, sA, LEDA_X, LEDA_Y, LEDA_Z, "A");
+  processOne(mpuB, sB, LEDB_X, LEDB_Y, LEDB_Z, "B");
+  delay(20);
 }
