@@ -38,6 +38,7 @@ const float POS_CLAMP = 0.30f;  // m   (30 cm envelope)
 // LEDs
 const uint8_t LED_BLINK = 8;     // startup blink
 
+const uint8_t LED_PULL_BACK = 5;
 // Forward (+X) LEDs only
 const uint8_t LED_A_FWD = 6;     // forward for MPU A
 const uint8_t LED_B_FWD = 7;     // forward for MPU B
@@ -48,6 +49,20 @@ const uint8_t WHO_AM_I_VALUE = 0x68;  // expected for MPU6050
 const uint8_t HEALTH_FAIL_LIMIT = 3;
 const uint16_t HEALTH_PERIOD_MS = 500;
 const uint16_t FAIL_BLINK_MS = 100;
+
+// Backward (−X) thresholds (m/s^2) — with hysteresis
+const float BACK_X_ON_MS2  = -8.0f;   // both MPUs must be under this to trigger
+const float BACK_X_OFF_MS2 = -4.0f;   // release threshold
+const uint16_t PULLBACK_HOLD_MS = 120; // optional hold before release
+
+// Pull-back position thresholds (meters, magnitudes)
+const float PB_POS_ON_M  = 0.06f;  // 4 cm back to trigger
+const float PB_POS_OFF_M = 0.04f;  // 2 cm back to release
+
+// Global state for the "both pulled back" condition
+bool bothBack_on = false;
+unsigned long tBothBack = 0;
+
 
 // ----- STATE -----
 struct GravState {
@@ -60,6 +75,9 @@ struct GravState {
 
   bool punch_on = false;
   unsigned long tPunch = 0;
+  
+  // NEW: last computed linear accel on X (for backward check)
+  float lx_last = 0.0f;
 };
 
 GravState sA, sB;
@@ -75,6 +93,11 @@ HealthState hA, hB;
 static inline float mag3(float x, float y, float z) {
   return sqrtf(x*x + y*y + z*z);
 }
+
+struct PullBackState {
+  bool active = false;
+  unsigned long tOn = 0;
+} pullBack;
 
 bool i2cReadReg8(uint8_t addr, uint8_t reg, uint8_t &val) {
   Wire.beginTransmission(addr);
@@ -148,6 +171,33 @@ void seedGravity(Adafruit_MPU6050 &mpu, GravState &st, const char *tag) {
   }
 }
 
+// Solid pull-back indicator on LED 5 whenever BOTH sensors are far enough back.
+void updatePullBack(const GravState &sa, const GravState &sb,
+                    const HealthState &ha, const HealthState &hb,
+                    unsigned long now) {
+  // require both sensors healthy
+  if (!(ha.healthy && hb.healthy)) {
+    digitalWrite(LED_PULL_BACK, LOW);
+    bothBack_on = false;
+    return;
+  }
+
+  // PB_POS_ON_M / PB_POS_OFF_M are negative (backward). Use hysteresis:
+  bool bothOnCond  = (sa.px < PB_POS_ON_M)  || (sb.px < PB_POS_ON_M);   // more negative -> on
+  bool eitherOffCond = (sa.px > PB_POS_OFF_M) && (sb.px > PB_POS_OFF_M); // moved forward enough -> off
+
+  if (!bothBack_on && bothOnCond) {
+    bothBack_on = true;
+    tBothBack = now;
+  } else if (bothBack_on && eitherOffCond) {
+    bothBack_on = false;
+  }
+
+  digitalWrite(LED_PULL_BACK, bothBack_on ? LOW : HIGH);
+}
+
+
+
 // ------- 1D kinematics helpers (decay factors per dt) -------
 static inline float decayFactor(float dt_s, float tau_s) {
   // Protect against tiny/huge dt
@@ -190,6 +240,8 @@ void punch(Adafruit_MPU6050 &mpu, GravState &st, const char *tag, bool isA) {
   // --- 1D forward kinematics with decay to limit drift ---
   float kv = decayFactor(dt, TAU_VEL_S);
   float kp = decayFactor(dt, TAU_POS_S);
+
+  st.lx_last = lx;
 
   // Leak previous state (decay), then integrate
   st.vx = st.vx * kv + lx * dt;
@@ -243,6 +295,8 @@ void setup() {
   pinMode(LED_BLINK, OUTPUT);
   pinMode(LED_A_FWD, OUTPUT);
   pinMode(LED_B_FWD, OUTPUT);
+  pinMode(LED_PULL_BACK, OUTPUT);
+  digitalWrite(LED_PULL_BACK, LOW);
   clearFwdLEDs(true);
   clearFwdLEDs(false);
 
@@ -294,5 +348,7 @@ void loop() {
   if (hA.healthy) punch(mpuA, sA, "A", true);
   if (hB.healthy) punch(mpuB, sB, "B", false);
 
+  // New: evaluate separate "pull back" feature (may override LED 6 while active)
+  updatePullBack(sA, sB, hA, hB, now);
   delay(20);
 }
