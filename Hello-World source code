@@ -1,55 +1,120 @@
-// Two MPU6050 accel→LEDs with gravity removal + hysteresis + magnitude + hold-time
-// MPU A -> LEDs D6/D7/D8;  MPU B -> LEDs D9/D10/D11
-
+// Dual MPU6050 with X-axis trigger + health monitoring (identify which MPU fails)
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <Wire.h>
 #include <math.h>
 
+// ----- I2C ADDRESSES -----
+const uint8_t ADDR_A = 0x68;   // AD0=GND
+const uint8_t ADDR_B = 0x69;   // AD0=VCC
+
 // ----- SENSORS -----
-Adafruit_MPU6050 mpuA;   // address 0x68 (AD0=GND)
-Adafruit_MPU6050 mpuB;   // address 0x69 (AD0=VCC)
+Adafruit_MPU6050 mpuA;
+Adafruit_MPU6050 mpuB;
 
 // ----- CONFIG -----
-// const int LEDA_X = 6,  LEDA_Y = 7,  LEDA_Z = 8;   // LEDs for sensor A
-// const int LEDB_X = 3,  LEDB_Y = 4, LEDB_Z = 5;  // LEDs for sensor B
-
-// Linear acceleration thresholds (after gravity removal)
-const float THRESH_ON  = 1.2f;   // ~0.12 g — moderate hand shake
-const float THRESH_OFF = 0.8f;   // hysteresis
 float alpha = 0.95f;             // gravity LPF factor
+const uint16_t HOLD_MS = 150;    // LED hold after trigger (ms)
 
-const uint16_t HOLD_MS = 150;    // keep LEDs on briefly so they're visible
+// X-axis thresholds (m/s^2)
+const float THRESH_X_ON_MS2  = 10.0f;  // trigger
+const float THRESH_X_OFF_MS2 = 6.0f;   // release
 
-// Per-sensor gravity estimate/state
+// LEDs
+const uint8_t LED_BLINK = 8;     // startup blink
+
+// Forward (+X) LEDs only
+const uint8_t LED_A_FWD = 6;     // forward for MPU A
+const uint8_t LED_B_FWD = 7;     // forward for MPU B
+
+// Health monitor
+const uint8_t WHO_AM_I_REG   = 0x75;
+const uint8_t WHO_AM_I_VALUE = 0x68;  // expected for MPU6050
+const uint8_t HEALTH_FAIL_LIMIT = 3;
+const uint16_t HEALTH_PERIOD_MS = 500;
+const uint16_t FAIL_BLINK_MS = 100;
+
+// ----- STATE -----
 struct GravState {
   bool g_init = false;
   float gx = 0, gy = 0, gz = 0;
-  bool x_on = false, y_on = false, z_on = false;
-  unsigned long tX = 0, tY = 0, tZ = 0;
+  bool punch_on = false;
+  unsigned long tPunch = 0;
 };
+
 GravState sA, sB;
 
-// ---------- helpers ----------
-void ledInit() {
-  int pins[] = {LEDA_X, LEDA_Y, LEDA_Z, LEDB_X, LEDB_Y, LEDB_Z};
-  for (int p : pins) { pinMode(p, OUTPUT); digitalWrite(p, LOW); }
-  delay(150);
-  for (int p : pins) digitalWrite(p, HIGH);
-  delay(150);
-  for (int p : pins) digitalWrite(p, LOW);
+struct HealthState {
+  bool healthy = true;
+  uint8_t failCount = 0;
+  unsigned long lastCheck = 0;
+};
+HealthState hA, hB;
+
+// ----- HELPERS -----
+static inline float mag3(float x, float y, float z) {
+  return sqrtf(x*x + y*y + z*z);
 }
 
-bool beginMPU(Adafruit_MPU6050 &mpu, uint8_t addr) {
-  if (!mpu.begin(addr)) return false;
+bool i2cReadReg8(uint8_t addr, uint8_t reg, uint8_t &val) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  uint8_t tx = Wire.endTransmission(false);
+  if (tx != 0) return false;
+
+  uint8_t n = Wire.requestFrom((int)addr, 1, (int)true);
+  if (n != 1) return false;
+
+  val = Wire.read();
+  return true;
+}
+
+void checkHealth(uint8_t addr, HealthState &hs, const char *tag) {
+  uint8_t v = 0x00;
+  bool ok = i2cReadReg8(addr, WHO_AM_I_REG, v) && (v == WHO_AM_I_VALUE);
+
+  if (!ok) {
+    if (hs.failCount < 255) hs.failCount++;
+    if (hs.failCount >= HEALTH_FAIL_LIMIT && hs.healthy) {
+      hs.healthy = false;
+      Serial.print(tag); Serial.println(" unhealthy (WHO_AM_I failed)");
+    }
+  } else {
+    if (!hs.healthy) {
+      Serial.print(tag); Serial.println(" recovered");
+    }
+    hs.healthy = true;
+    hs.failCount = 0;
+  }
+}
+
+bool beginMPU(Adafruit_MPU6050 &mpu, uint8_t addr, const char *tag) {
+  if (!mpu.begin(addr)) {
+    Serial.print(tag); Serial.println(" begin() failed");
+    return false;
+  }
   mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
   mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
   return true;
 }
 
-// Process one sensor: read, remove gravity, apply hysteresis/hold, drive its LEDs
-void processOne(Adafruit_MPU6050 &mpu, GravState &st, int Lx, int Ly, int Lz, const char *tag) {
+// ---- LED helpers ----
+inline bool blinkFast(unsigned long now) { return ((now / 100) % 2) == 0; }
+
+void setFwdLED(bool isA, bool on, unsigned long now) {
+  bool ledState = on && blinkFast(now);  // blink while active
+  if (isA) digitalWrite(LED_A_FWD, ledState ? HIGH : LOW);
+  else     digitalWrite(LED_B_FWD, ledState ? HIGH : LOW);
+}
+
+void clearFwdLEDs(bool isA) {
+  if (isA) digitalWrite(LED_A_FWD, LOW);
+  else     digitalWrite(LED_B_FWD, LOW);
+}
+
+// Process one sensor when healthy: update LPF and X-axis trigger (+X only)
+void processOne(Adafruit_MPU6050 &mpu, GravState &st, const char *tag, bool isA) {
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
 
@@ -58,69 +123,95 @@ void processOne(Adafruit_MPU6050 &mpu, GravState &st, int Lx, int Ly, int Lz, co
     st.g_init = true;
   }
 
-  // Low-pass to estimate gravity
+  // Gravity LPF
   st.gx = alpha * st.gx + (1.0f - alpha) * a.acceleration.x;
   st.gy = alpha * st.gy + (1.0f - alpha) * a.acceleration.y;
   st.gz = alpha * st.gz + (1.0f - alpha) * a.acceleration.z;
 
-  // Linear acceleration
+  // Linear acceleration (m/s^2)
   float lx = a.acceleration.x - st.gx;
   float ly = a.acceleration.y - st.gy;
   float lz = a.acceleration.z - st.gz;
+  float amag = mag3(lx, ly, lz);
 
-  float ax = fabs(lx), ay = fabs(ly), az = fabs(lz);
-  float amag = sqrt(lx*lx + ly*ly + lz*lz);
-
-  // Per-axis hysteresis + hold
   unsigned long now = millis();
-  if (!st.x_on && ax > THRESH_ON) { st.x_on = true; st.tX = now; }
-  if ( st.x_on && (ax < THRESH_OFF) && (now - st.tX > HOLD_MS)) st.x_on = false;
+  bool on = st.punch_on;
 
-  if (!st.y_on && ay > THRESH_ON) { st.y_on = true; st.tY = now; }
-  if ( st.y_on && (ay < THRESH_OFF) && (now - st.tY > HOLD_MS)) st.y_on = false;
+  // Simple +X hysteresis + hold
+  if (!st.punch_on && lx > THRESH_X_ON_MS2) {
+    st.punch_on = true;
+    st.tPunch = now;
+  } else if (st.punch_on && (lx < THRESH_X_OFF_MS2) && (now - st.tPunch > HOLD_MS)) {
+    st.punch_on = false;
+  }
 
-  if (!st.z_on && az > THRESH_ON) { st.z_on = true; st.tZ = now; }
-  if ( st.z_on && (az < THRESH_OFF) && (now - st.tZ > HOLD_MS)) st.z_on = false;
+  // Drive LED (blink while active)
+  if (st.punch_on) setFwdLED(isA, true, now);
+  else             clearFwdLEDs(isA);
 
-  // Drive LEDs for this sensor
-  digitalWrite(Lx, st.x_on ? HIGH : LOW);
-  digitalWrite(Ly, st.y_on ? HIGH : LOW);
-  digitalWrite(Lz, st.z_on ? HIGH : LOW);
-
-  // Debug (prefix with sensor tag)
-  Serial.print(tag); Serial.print(" Lin X:"); Serial.print(lx,2);
-  Serial.print(" Y:");  Serial.print(ly,2);
-  Serial.print(" Z:");  Serial.print(lz,2);
-  Serial.print(" | |a|:"); Serial.println(amag,2);
+  // Debug
+  Serial.print(tag);
+  Serial.print(" lx:"); Serial.print(lx,2);
+  Serial.print(" ly:"); Serial.print(ly,2);
+  Serial.print(" lz:"); Serial.print(lz,2);
+  Serial.print(" | |a|:"); Serial.print(amag,2);
+  if (st.punch_on) Serial.print("  <-- +X TRIGGER");
+  Serial.println();
 }
 
 void setup() {
   Serial.begin(115200);
-  // while (!Serial) delay(10); // keep disabled for bare 328P
-  ledInit();
-
-  // I2C
   Wire.begin();
 
-  // Start both MPUs (A:0x68, B:0x69)
-  if (!beginMPU(mpuA, 0x68) || !beginMPU(mpuB, 0x69)) {
-    // flash all LEDs rapidly on error
-    for (;;) {
-      digitalWrite(LEDA_X, !digitalRead(LEDA_X));
-      digitalWrite(LEDA_Y, !digitalRead(LEDA_Y));
-      digitalWrite(LEDA_Z, !digitalRead(LEDA_Z));
-      digitalWrite(LEDB_X, !digitalRead(LEDB_X));
-      digitalWrite(LEDB_Y, !digitalRead(LEDB_Y));
-      digitalWrite(LEDB_Z, !digitalRead(LEDB_Z));
-      delay(150);
-    }
+  pinMode(LED_BLINK, OUTPUT);
+  pinMode(LED_A_FWD, OUTPUT);
+  pinMode(LED_B_FWD, OUTPUT);
+  clearFwdLEDs(true);
+  clearFwdLEDs(false);
+
+  // Startup blink
+  for (int i=0; i<3; i++) {
+    digitalWrite(LED_BLINK, HIGH); delay(200);
+    digitalWrite(LED_BLINK, LOW); delay(200);
   }
+
+  // Initialize MPUs
+  bool okA = beginMPU(mpuA, ADDR_A, "MPU A");
+  bool okB = beginMPU(mpuB, ADDR_B, "MPU B");
+
+  checkHealth(ADDR_A, hA, "MPU A");
+  checkHealth(ADDR_B, hB, "MPU B");
+
+  if (!okA) { hA.healthy = false; hA.failCount = HEALTH_FAIL_LIMIT; }
+  if (!okB) { hB.healthy = false; hB.failCount = HEALTH_FAIL_LIMIT; }
+
+  Serial.println("Health monitor active: WHO_AM_I checks + fast-blink on failure");
   delay(100);
-  Serial.println("Dual MPU6050 linear-accel LED demo");
 }
 
 void loop() {
-  processOne(mpuA, sA, LEDA_X, LEDA_Y, LEDA_Z, "A");
-  processOne(mpuB, sB, LEDB_X, LEDB_Y, LEDB_Z, "B");
+  unsigned long now = millis();
+
+  // Periodic health checks
+  if (now - hA.lastCheck >= HEALTH_PERIOD_MS) {
+    hA.lastCheck = now;
+    checkHealth(ADDR_A, hA, "MPU A");
+  }
+  if (now - hB.lastCheck >= HEALTH_PERIOD_MS) {
+    hB.lastCheck = now;
+    checkHealth(ADDR_B, hB, "MPU B");
+  }
+
+  // Failure indication: blink forward LEDs
+  bool aFailBlink = (!hA.healthy) && ((now / FAIL_BLINK_MS) % 2);
+  bool bFailBlink = (!hB.healthy) && ((now / FAIL_BLINK_MS) % 2);
+
+  if (!hA.healthy) digitalWrite(LED_A_FWD, aFailBlink ? HIGH : LOW);
+  if (!hB.healthy) digitalWrite(LED_B_FWD, bFailBlink ? HIGH : LOW);
+
+  // Only process healthy sensors for punch/X-axis logic
+  if (hA.healthy) processOne(mpuA, sA, "A", true);
+  if (hB.healthy) processOne(mpuB, sB, "B", false);
+
   delay(20);
 }
