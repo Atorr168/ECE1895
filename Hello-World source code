@@ -1,4 +1,5 @@
 // Dual MPU6050 with X-axis trigger + health monitoring (identify which MPU fails)
+// Now also requires forward DISPLACEMENT relative to initial pose, not just accel.
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <Wire.h>
@@ -17,8 +18,22 @@ float alpha = 0.95f;             // gravity LPF factor
 const uint16_t HOLD_MS = 150;    // LED hold after trigger (ms)
 
 // X-axis thresholds (m/s^2)
-const float THRESH_X_ON_MS2  = 10.0f;  // trigger
-const float THRESH_X_OFF_MS2 = 6.0f;   // release
+const float THRESH_X_ON_MS2  = 10.0f;  // accel trigger
+const float THRESH_X_OFF_MS2 = 6.0f;   // accel release
+
+// NEW: Position thresholds (meters) – relative forward displacement (+X)
+const float POS_ON_M  = 0.04f;  // ~4 cm forward required to trigger
+const float POS_OFF_M = 0.02f;  // ~2 cm (hysteresis)
+
+// Integration drift control (time constants, seconds)
+// Smaller tau => stronger decay
+const float TAU_VEL_S = 0.25f;  // velocity leak (quarter-second memory)
+const float TAU_POS_S = 2.0f;   // position leak (multi-second memory)
+const float DT_MAX_S  = 0.05f;  // dt clamp for robustness (~20 Hz)
+
+// Optional hard clamps to keep integrator bounded
+const float VEL_CLAMP = 10.0f;  // m/s (well above human punch)
+const float POS_CLAMP = 0.30f;  // m   (30 cm envelope)
 
 // LEDs
 const uint8_t LED_BLINK = 8;     // startup blink
@@ -37,7 +52,12 @@ const uint16_t FAIL_BLINK_MS = 100;
 // ----- STATE -----
 struct GravState {
   bool g_init = false;
-  float gx = 0, gy = 0, gz = 0;
+  float gx = 0, gy = 0, gz = 0;    // gravity estimate
+  // NEW: simple 1D kinematics along +X
+  float vx = 0;                    // forward velocity (m/s)
+  float px = 0;                    // forward displacement from start (m)
+  unsigned long tLast = 0;         // last update time (ms)
+
   bool punch_on = false;
   unsigned long tPunch = 0;
 };
@@ -113,15 +133,48 @@ void clearFwdLEDs(bool isA) {
   else     digitalWrite(LED_B_FWD, LOW);
 }
 
-// Process one sensor when healthy: update LPF and X-axis trigger (+X only)
-void processOne(Adafruit_MPU6050 &mpu, GravState &st, const char *tag, bool isA) {
+void seedGravity(Adafruit_MPU6050 &mpu, GravState &st, const char *tag) {
+  sensors_event_t a, g, temp;
+  if (!st.g_init) {
+    mpu.getEvent(&a, &g, &temp);
+    st.gx = a.acceleration.x;
+    st.gy = a.acceleration.y;
+    st.gz = a.acceleration.z;
+    st.vx = 0.0f;
+    st.px = 0.0f;
+    st.tLast = millis();
+    st.g_init = true;
+    Serial.print(tag); Serial.println(" gravity/kinematics seeded");
+  }
+}
+
+// ------- 1D kinematics helpers (decay factors per dt) -------
+static inline float decayFactor(float dt_s, float tau_s) {
+  // Protect against tiny/huge dt
+  if (tau_s <= 0.0f) return 0.0f;
+  if (dt_s < 0.0f) dt_s = 0.0f;
+  if (dt_s > 5.0f) dt_s = 5.0f;
+  return expf(-dt_s / tau_s);
+}
+
+// Process one sensor when healthy: update LPF, integrate X kinematics,
+// and trigger only if forward position AND forward accel exceed thresholds.
+void punch(Adafruit_MPU6050 &mpu, GravState &st, const char *tag, bool isA) {
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
 
+  unsigned long now = millis();
   if (!st.g_init) {
     st.gx = a.acceleration.x; st.gy = a.acceleration.y; st.gz = a.acceleration.z;
+    st.vx = 0.0f; st.px = 0.0f;
+    st.tLast = now;
     st.g_init = true;
   }
+
+  // dt (seconds), clamped
+  float dt = (now - st.tLast) * 0.001f;
+  if (dt > DT_MAX_S) dt = DT_MAX_S;
+  st.tLast = now;
 
   // Gravity LPF
   st.gx = alpha * st.gx + (1.0f - alpha) * a.acceleration.x;
@@ -134,15 +187,37 @@ void processOne(Adafruit_MPU6050 &mpu, GravState &st, const char *tag, bool isA)
   float lz = a.acceleration.z - st.gz;
   float amag = mag3(lx, ly, lz);
 
-  unsigned long now = millis();
-  bool on = st.punch_on;
+  // --- 1D forward kinematics with decay to limit drift ---
+  float kv = decayFactor(dt, TAU_VEL_S);
+  float kp = decayFactor(dt, TAU_POS_S);
 
-  // Simple +X hysteresis + hold
-  if (!st.punch_on && lx > THRESH_X_ON_MS2) {
+  // Leak previous state (decay), then integrate
+  st.vx = st.vx * kv + lx * dt;
+  // Bound velocity to keep insane spikes from accumulating
+  if (st.vx >  VEL_CLAMP) st.vx =  VEL_CLAMP;
+  if (st.vx < -VEL_CLAMP) st.vx = -VEL_CLAMP;
+
+  st.px = st.px * kp + st.vx * dt;
+  if (st.px >  POS_CLAMP) st.px =  POS_CLAMP;
+  if (st.px < -POS_CLAMP) st.px = -POS_CLAMP;
+
+  // --- Trigger logic: require BOTH forward accel and forward position ---
+  if (!st.punch_on && (lx > THRESH_X_ON_MS2) && (st.px > POS_ON_M)) {
     st.punch_on = true;
     st.tPunch = now;
-  } else if (st.punch_on && (lx < THRESH_X_OFF_MS2) && (now - st.tPunch > HOLD_MS)) {
+  } else if (st.punch_on &&
+             (now - st.tPunch > HOLD_MS) &&
+             ((lx < THRESH_X_OFF_MS2) || (st.px < POS_OFF_M))) {
     st.punch_on = false;
+    // Optional: reset integrators a bit to avoid immediate retriggering
+    st.vx *= 0.2f;
+    st.px *= 0.5f;
+  } else {
+    // If not punching, gently relax back toward zero to reduce bias
+    if (!st.punch_on) {
+      st.vx *= kv;
+      st.px *= kp;
+    }
   }
 
   // Drive LED (blink while active)
@@ -155,7 +230,9 @@ void processOne(Adafruit_MPU6050 &mpu, GravState &st, const char *tag, bool isA)
   Serial.print(" ly:"); Serial.print(ly,2);
   Serial.print(" lz:"); Serial.print(lz,2);
   Serial.print(" | |a|:"); Serial.print(amag,2);
-  if (st.punch_on) Serial.print("  <-- +X TRIGGER");
+  Serial.print(" | vx:"); Serial.print(st.vx,2);
+  Serial.print(" px:");  Serial.print(st.px*100.0f,1); // cm
+  if (st.punch_on) Serial.print("  <-- +X PUNCH (accel+pos)");
   Serial.println();
 }
 
@@ -185,6 +262,10 @@ void setup() {
   if (!okA) { hA.healthy = false; hA.failCount = HEALTH_FAIL_LIMIT; }
   if (!okB) { hB.healthy = false; hB.failCount = HEALTH_FAIL_LIMIT; }
 
+  // Seed gravity/kinematics immediately for healthy sensors
+  if (hA.healthy) seedGravity(mpuA, sA, "A");
+  if (hB.healthy) seedGravity(mpuB, sB, "B");
+
   Serial.println("Health monitor active: WHO_AM_I checks + fast-blink on failure");
   delay(100);
 }
@@ -210,8 +291,8 @@ void loop() {
   if (!hB.healthy) digitalWrite(LED_B_FWD, bFailBlink ? HIGH : LOW);
 
   // Only process healthy sensors for punch/X-axis logic
-  if (hA.healthy) processOne(mpuA, sA, "A", true);
-  if (hB.healthy) processOne(mpuB, sB, "B", false);
+  if (hA.healthy) punch(mpuA, sA, "A", true);
+  if (hB.healthy) punch(mpuB, sB, "B", false);
 
   delay(20);
 }
