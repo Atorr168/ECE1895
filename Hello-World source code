@@ -1,9 +1,18 @@
 // Dual MPU6050 with X-axis trigger + health monitoring (identify which MPU fails)
 // Now also requires forward DISPLACEMENT relative to initial pose, not just accel.
+// FIXES:
+//  - Proper per-sensor 3×3 orientation mapping (no ad-hoc X flip)
+//  - Averaged gravity seed
+//  - Freeze gravity LPF during high dynamics so it won't "learn" the shove
+//  - Separate kinematics for punch vs. pull-back (longer memory for pull-back)
+//  - Expanded debug: raw (mapped) accel, gravity estimate, dt
+
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <Wire.h>
 #include <math.h>
+
+unsigned long lastDbgA=0, lastDbgB=0;
 
 // ----- I2C ADDRESSES -----
 const uint8_t ADDR_A = 0x68;   // AD0=GND
@@ -14,25 +23,31 @@ Adafruit_MPU6050 mpuA;
 Adafruit_MPU6050 mpuB;
 
 // ----- CONFIG -----
-float alpha = 0.95f;             // gravity LPF factor
+float alpha = 0.98f; // gravity LPF factor
 const uint16_t HOLD_MS = 150;    // LED hold after trigger (ms)
 
 // X-axis thresholds (m/s^2)
-const float THRESH_X_ON_MS2  = 10.0f;  // accel trigger
-const float THRESH_X_OFF_MS2 = 6.0f;   // accel release
+const float THRESH_X_ON_MS2  =10.0f;
+const float THRESH_X_OFF_MS2 = 1.2f;
 
-// NEW: Position thresholds (meters) – relative forward displacement (+X)
-const float POS_ON_M  = 0.04f;  // ~4 cm forward required to trigger
-const float POS_OFF_M = 0.02f;  // ~2 cm (hysteresis)
+// Punch displacement gates (meters, forward = +X)
+const float POS_ON_M  = 0.03f;
+const float POS_OFF_M = 0.015f;
 
 // Integration drift control (time constants, seconds)
 // Smaller tau => stronger decay
-const float TAU_VEL_S = 0.25f;  // velocity leak (quarter-second memory)
-const float TAU_POS_S = 2.0f;   // position leak (multi-second memory)
-const float DT_MAX_S  = 0.05f;  // dt clamp for robustness (~20 Hz)
+const float TAU_VEL_S = 0.25f;  // velocity leak (quarter-second memory) [punch]
+const float TAU_POS_S = 2.0f;   // position leak (multi-second memory)  [punch]
+
+// >>> pull-back: longer memory so slow moves accumulate
+const float TAU_VEL_PB_S = 1.0f; // pull-back velocity leak (longer than punch)
+const float TAU_POS_PB_S = 4.0f; // pull-back position leak (longer memory)
+
+// dt clamp for robustness (~20 Hz)
+const float DT_MAX_S  = 0.05f;
 
 // Optional hard clamps to keep integrator bounded
-const float VEL_CLAMP = 10.0f;  // m/s (well above human punch)
+const float VEL_CLAMP = 10.0f;  // m/s
 const float POS_CLAMP = 0.30f;  // m   (30 cm envelope)
 
 // LEDs
@@ -50,7 +65,6 @@ const uint8_t BCD_PINS[4] = {2, 3, 4, 9}; // A,B,C,D (choose any free pins)
 const uint8_t EN_A = 10;  // -> BI/_A
 const uint8_t EN_B = 11;  // -> BI/_B
 
-
 // Health monitor
 const uint8_t WHO_AM_I_REG   = 0x75;
 const uint8_t WHO_AM_I_VALUE = 0x68;  // expected for MPU6050
@@ -58,34 +72,61 @@ const uint8_t HEALTH_FAIL_LIMIT = 3;
 const uint16_t HEALTH_PERIOD_MS = 500;
 const uint16_t FAIL_BLINK_MS = 100;
 
-// Backward (−X) thresholds (m/s^2) — with hysteresis
-const float BACK_X_ON_MS2  = -8.0f;   // both MPUs must be under this to trigger
-const float BACK_X_OFF_MS2 = -4.0f;   // release threshold
-const uint16_t PULLBACK_HOLD_MS = 120; // optional hold before release
+// Backward (−X) accel thresholds (m/s^2) — with hysteresis (unused for LED but kept)
+const float BACK_X_ON_MS2  = -8.0f;
+const float BACK_X_OFF_MS2 = -4.0f;
+const uint16_t PULLBACK_HOLD_MS = 120;
 
-// Pull-back position thresholds (meters, magnitudes)
-const float PB_POS_ON_M  = 0.06f;  // 4 cm back to trigger
-const float PB_POS_OFF_M = 0.04f;  // 2 cm back to release
+// >>> pull-back position thresholds (meters, NEGATIVE for back)
+const float PB_POS_ON_M  = -0.05f;  // ≈ 5 cm behind start
+const float PB_POS_OFF_M = -0.035f; // ≈ 3.5 cm (hysteresis)
 
-// Global state for the "both pulled back" condition
-bool bothBack_on = false;
-unsigned long tBothBack = 0;
+// physical forward previously read as −X; flip X so forward ⇒ +X
+const int8_t ORIENT_A[9] = {
+  -1, 0, 0,
+   0,+1, 0,
+   0, 0,+1
+};
+const int8_t ORIENT_B[9] = {
+  -1, 0, 0,
+   0,+1, 0,
+   0, 0,+1
+};
 
+// widen quiet window so a slightly-tilted board isn't considered "dynamic"
+const float G_NOMINAL = 9.80665f;
+const float G_LOW  = 8.8f;
+const float G_HIGH = 11.5f;
+
+// stillness auto-reseed (off by default; variables kept in case you want it later)
+const float STILL_LIN_THR = 0.10f;
+const float STILL_WIN_S   = 1.0f;
+unsigned long stillStartA = 0, stillStartB = 0;
+bool wantReseedA = false, wantReseedB = false;
+
+// // Global state for the "both pulled back" condition
+// bool bothBack_on = false;
+// unsigned long tBothBack = 0;
 
 // ----- STATE -----
 struct GravState {
   bool g_init = false;
   float gx = 0, gy = 0, gz = 0;    // gravity estimate
-  // NEW: simple 1D kinematics along +X
-  float vx = 0;                    // forward velocity (m/s)
-  float px = 0;                    // forward displacement from start (m)
+
+  // Simple 1D kinematics along +X (punch path)
+  float vx = 0;    // forward velocity (m/s) [punch]
+  float px = 0;    // forward displacement for punch gate (m)
+
+  // >>> pull-back: separate, longer-memory kinematics
+  float vx_pb = 0; // pull-back velocity (m/s) with longer memory
+  float pbx  = 0;  // backward/forward displacement for pull-back (m)
+
   unsigned long tLast = 0;         // last update time (ms)
 
   bool punch_on = false;
   unsigned long tPunch = 0;
-  
-  // NEW: last computed linear accel on X (for backward check)
-  float lx_last = 0.0f;
+
+  float lx_last = 0.0f; // last linear accel X
 };
 
 GravState sA, sB;
@@ -98,48 +139,51 @@ struct HealthState {
 HealthState hA, hB;
 
 // ----- HELPERS -----
-
-// write 0–9 on the shared BCD bus
-void writeBCD(uint8_t val) {
-  val &= 0x0F;
-  // bit0 -> A, bit1 -> B, bit2 -> C, bit3 -> D
-  for (int i = 0; i < 4; ++i) {
-    digitalWrite(BCD_PINS[i], (val >> i) & 1);
-  }
-}
-
-void showDigitAB(uint8_t leftVal, uint8_t rightVal, bool showLeft) {
-  // Blank both first (BI/ LOW blanks)
-  digitalWrite(EN_A, LOW);
-  digitalWrite(EN_B, LOW);
-
-  if (showLeft) {
-    writeBCD(leftVal);
-    digitalWrite(EN_A, HIGH); // enable A
-  } else {
-    writeBCD(rightVal);
-    digitalWrite(EN_B, HIGH); // enable B
-  }
-}
-
 static inline float mag3(float x, float y, float z) {
   return sqrtf(x*x + y*y + z*z);
 }
 
-struct PullBackState {
-  bool active = false;
-  unsigned long tOn = 0;
-} pullBack;
+// renormalize g to 1g
+static inline void renormG(GravState &st) {
+  float gm = mag3(st.gx, st.gy, st.gz);
+  if (gm > 1e-3f) {
+    float s = G_NOMINAL / gm;
+    st.gx *= s; st.gy *= s; st.gz *= s;
+  }
+}
+
+void writeBCD(uint8_t val) {
+  val &= 0x0F;
+  for (int i = 0; i < 4; ++i) digitalWrite(BCD_PINS[i], (val >> i) & 1);
+}
+
+void showDigitAB(uint8_t leftVal, uint8_t rightVal, bool showLeft) {
+  digitalWrite(EN_A, LOW);
+  digitalWrite(EN_B, LOW);
+  if (showLeft) { writeBCD(leftVal);  digitalWrite(EN_A, HIGH); }
+  else          { writeBCD(rightVal); digitalWrite(EN_B, HIGH); }
+}
+
+struct PullBackState { bool active = false; unsigned long tOn = 0; } pullBack;
+
+// Map raw MPU frame -> shared body frame using a 3×3 with entries in {-1,0,1}
+static inline void mapAccel(const sensors_event_t &a, const int8_t M[9],
+                            float &ax, float &ay, float &az) {
+  const float rx = a.acceleration.x;
+  const float ry = a.acceleration.y;
+  const float rz = a.acceleration.z;
+  ax = M[0]*rx + M[1]*ry + M[2]*rz;
+  ay = M[3]*rx + M[4]*ry + M[5]*rz;
+  az = M[6]*rx + M[7]*ry + M[8]*rz;
+}
 
 bool i2cReadReg8(uint8_t addr, uint8_t reg, uint8_t &val) {
   Wire.beginTransmission(addr);
   Wire.write(reg);
   uint8_t tx = Wire.endTransmission(false);
   if (tx != 0) return false;
-
   uint8_t n = Wire.requestFrom((int)addr, 1, (int)true);
   if (n != 1) return false;
-
   val = Wire.read();
   return true;
 }
@@ -147,7 +191,6 @@ bool i2cReadReg8(uint8_t addr, uint8_t reg, uint8_t &val) {
 void checkHealth(uint8_t addr, HealthState &hs, const char *tag) {
   uint8_t v = 0x00;
   bool ok = i2cReadReg8(addr, WHO_AM_I_REG, v) && (v == WHO_AM_I_VALUE);
-
   if (!ok) {
     if (hs.failCount < 255) hs.failCount++;
     if (hs.failCount >= HEALTH_FAIL_LIMIT && hs.healthy) {
@@ -155,9 +198,7 @@ void checkHealth(uint8_t addr, HealthState &hs, const char *tag) {
       Serial.print(tag); Serial.println(" unhealthy (WHO_AM_I failed)");
     }
   } else {
-    if (!hs.healthy) {
-      Serial.print(tag); Serial.println(" recovered");
-    }
+    if (!hs.healthy) { Serial.print(tag); Serial.println(" recovered"); }
     hs.healthy = true;
     hs.failCount = 0;
   }
@@ -178,146 +219,172 @@ bool beginMPU(Adafruit_MPU6050 &mpu, uint8_t addr, const char *tag) {
 inline bool blinkFast(unsigned long now) { return ((now / 100) % 2) == 0; }
 
 void setFwdLED(bool isA, bool on, unsigned long now) {
-  bool ledState = on && blinkFast(now);  // blink while active
+  bool ledState = on; // solid (not blinking)
   if (isA) digitalWrite(LED_A_FWD, ledState ? HIGH : LOW);
   else     digitalWrite(LED_B_FWD, ledState ? HIGH : LOW);
 }
+void clearFwdLEDs(bool isA) { if (isA) digitalWrite(LED_A_FWD, LOW); else digitalWrite(LED_B_FWD, LOW); }
 
-void clearFwdLEDs(bool isA) {
-  if (isA) digitalWrite(LED_A_FWD, LOW);
-  else     digitalWrite(LED_B_FWD, LOW);
-}
-
-void seedGravity(Adafruit_MPU6050 &mpu, GravState &st, const char *tag) {
+// --- averaged gravity seed to avoid seeding during micro-motion ---
+void seedGravity(Adafruit_MPU6050 &mpu, GravState &st, const char *tag, const int8_t ORIENT[9]) {
   sensors_event_t a, g, temp;
-  if (!st.g_init) {
+  const int N = 50;
+  float sx = 0, sy = 0, sz = 0;
+  for (int i=0; i<N; i++) {
     mpu.getEvent(&a, &g, &temp);
-    st.gx = a.acceleration.x;
-    st.gy = a.acceleration.y;
-    st.gz = a.acceleration.z;
-    st.vx = 0.0f;
-    st.px = 0.0f;
-    st.tLast = millis();
-    st.g_init = true;
-    Serial.print(tag); Serial.println(" gravity/kinematics seeded");
+    float ax, ay, az; mapAccel(a, ORIENT, ax, ay, az);
+    sx += ax; sy += ay; sz += az;
+    delay(2);
   }
+  st.gx = sx / N; st.gy = sy / N; st.gz = sz / N;
+  st.vx = 0.0f; st.px = 0.0f;
+  st.vx_pb = 0.0f; st.pbx = 0.0f;  // >>> pull-back: reset dedicated path
+  st.tLast = millis();
+  st.g_init = true;
+  Serial.print(tag); Serial.println(" gravity/kinematics seeded (avg)");
 }
 
-// Solid pull-back indicator on LED 5 whenever BOTH sensors are far enough back.
+// ACTIVE-HIGH LED: HIGH = ON, LOW = OFF
 void updatePullBack(const GravState &sa, const GravState &sb,
                     const HealthState &ha, const HealthState &hb,
                     unsigned long now) {
-  // require both sensors healthy
+  // LED OFF if either sensor is unhealthy
   if (!(ha.healthy && hb.healthy)) {
     digitalWrite(LED_PULL_BACK, LOW);
-    bothBack_on = false;
     return;
   }
 
-  // PB_POS_ON_M / PB_POS_OFF_M are negative (backward). Use hysteresis:
-  bool bothOnCond  = (sa.px < PB_POS_ON_M)  || (sb.px < PB_POS_ON_M);   // more negative -> on
-  bool eitherOffCond = (sa.px > PB_POS_OFF_M) && (sb.px > PB_POS_OFF_M); // moved forward enough -> off
-
-  if (!bothBack_on && bothOnCond) {
-    bothBack_on = true;
-    tBothBack = now;
-  } else if (bothBack_on && eitherOffCond) {
-    bothBack_on = false;
-  }
-
-  digitalWrite(LED_PULL_BACK, bothBack_on ? LOW : HIGH);
+  // Stateless gate: ON while both are behind -5 cm, OFF otherwise
+  const bool bothBackNow = (sa.pbx <= PB_POS_ON_M) && (sb.pbx <= PB_POS_ON_M);
+  digitalWrite(LED_PULL_BACK, bothBackNow ? HIGH : LOW);
 }
-
-
 
 // ------- 1D kinematics helpers (decay factors per dt) -------
 static inline float decayFactor(float dt_s, float tau_s) {
-  // Protect against tiny/huge dt
   if (tau_s <= 0.0f) return 0.0f;
   if (dt_s < 0.0f) dt_s = 0.0f;
   if (dt_s > 5.0f) dt_s = 5.0f;
   return expf(-dt_s / tau_s);
 }
 
-// Process one sensor when healthy: update LPF, integrate X kinematics,
-// and trigger only if forward position AND forward accel exceed thresholds.
-void punch(Adafruit_MPU6050 &mpu, GravState &st, const char *tag, bool isA) {
+// Process one sensor when healthy
+void punch(Adafruit_MPU6050 &mpu, GravState &st, const char *tag, bool isA, const int8_t ORIENT[9]) {
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
 
+  // Map raw accel to common body frame
+  float ax, ay, az; mapAccel(a, ORIENT, ax, ay, az);
+
   unsigned long now = millis();
   if (!st.g_init) {
-    st.gx = a.acceleration.x; st.gy = a.acceleration.y; st.gz = a.acceleration.z;
+    st.gx = ax; st.gy = ay; st.gz = az;
     st.vx = 0.0f; st.px = 0.0f;
-    st.tLast = now;
-    st.g_init = true;
+    st.vx_pb = 0.0f; st.pbx = 0.0f;      // >>> pull-back init
+    st.tLast = now; st.g_init = true;
   }
 
   // dt (seconds), clamped
-  float dt = (now - st.tLast) * 0.001f;
-  if (dt > DT_MAX_S) dt = DT_MAX_S;
-  st.tLast = now;
+  float dt = (now - st.tLast) * 0.001f; if (dt > DT_MAX_S) dt = DT_MAX_S; st.tLast = now;
 
-  // Gravity LPF
-  st.gx = alpha * st.gx + (1.0f - alpha) * a.acceleration.x;
-  st.gy = alpha * st.gy + (1.0f - alpha) * a.acceleration.y;
-  st.gz = alpha * st.gz + (1.0f - alpha) * a.acceleration.z;
+  // dynamic test using *raw* accel magnitude
+  float amag_raw = mag3(ax, ay, az);
+  bool dynamic = (amag_raw < G_LOW) || (amag_raw > G_HIGH);
 
-  // Linear acceleration (m/s^2)
-  float lx = a.acceleration.x - st.gx;
-  float ly = a.acceleration.y - st.gy;
-  float lz = a.acceleration.z - st.gz;
+  // LPF update (freeze only if clearly dynamic)
+  if (!dynamic) {
+    st.gx = alpha * st.gx + (1.0f - alpha) * ax;
+    st.gy = alpha * st.gy + (1.0f - alpha) * ay;
+    st.gz = alpha * st.gz + (1.0f - alpha) * az;
+    renormG(st);
+  }
+
+  // Linear acceleration (m/s^2) in body frame
+  float lx = ax - st.gx;
+  float ly = ay - st.gy;
+  float lz = az - st.gz;
   float amag = mag3(lx, ly, lz);
 
-  // --- 1D forward kinematics with decay to limit drift ---
-  float kv = decayFactor(dt, TAU_VEL_S);
-  float kp = decayFactor(dt, TAU_POS_S);
+  // --- forward kinematics with decay to limit drift ---
+  float kv    = decayFactor(dt, TAU_VEL_S);     // punch velocity leak
+  float kp    = decayFactor(dt, TAU_POS_S);     // punch position leak
+  float kv_pb = decayFactor(dt, TAU_VEL_PB_S);  // pull-back velocity leak (longer)
+  float kp_pb = decayFactor(dt, TAU_POS_PB_S);  // pull-back position leak (longer)
 
   st.lx_last = lx;
 
-  // Leak previous state (decay), then integrate
+  // velocity (punch path)
   st.vx = st.vx * kv + lx * dt;
-  // Bound velocity to keep insane spikes from accumulating
   if (st.vx >  VEL_CLAMP) st.vx =  VEL_CLAMP;
   if (st.vx < -VEL_CLAMP) st.vx = -VEL_CLAMP;
 
+  // position (for punch)
   st.px = st.px * kp + st.vx * dt;
   if (st.px >  POS_CLAMP) st.px =  POS_CLAMP;
   if (st.px < -POS_CLAMP) st.px = -POS_CLAMP;
 
-  // --- Trigger logic: require BOTH forward accel and forward position ---
-  if (!st.punch_on && (lx > THRESH_X_ON_MS2) && (st.px > POS_ON_M)) {
-    st.punch_on = true;
-    st.tPunch = now;
+  // >>> pull-back velocity (separate, longer memory)
+  // small-noise guard to avoid creep at rest
+  const float LX_NOISE = 0.03f; // m/s^2 ~3 mg
+  float lx_for_pb = (fabsf(lx) < LX_NOISE) ? 0.0f : lx;
+
+  st.vx_pb = st.vx_pb * kv_pb + lx_for_pb * dt;
+  if (st.vx_pb >  VEL_CLAMP) st.vx_pb =  VEL_CLAMP;
+  if (st.vx_pb < -VEL_CLAMP) st.vx_pb = -VEL_CLAMP;
+
+  // >>> pull-back position (integrate its own velocity)
+  st.pbx = st.pbx * kp_pb + st.vx_pb * dt;
+
+  // if going forward, bleed pbx a bit faster so it releases promptly
+  if (lx > 0.0f) st.pbx *= kp_pb;
+
+  if (st.pbx >  POS_CLAMP) st.pbx =  POS_CLAMP;
+  if (st.pbx < -POS_CLAMP) st.pbx = -POS_CLAMP;
+
+  // --- Trigger logic: require consistent forward motion (punch) ---
+  const bool forwardAccel = (lx > THRESH_X_ON_MS2);
+  const bool forwardVel   = (st.vx > 0.05f);
+  const bool forwardPos   = (st.px > POS_ON_M);
+
+  // Extra: if we see backward accel, aggressively bleed punch integrators
+  if (lx < 0.0f) {
+    st.vx *= 0.5f * kv;
+    st.px *= 0.7f * kp;
+  }
+
+  if (!st.punch_on && forwardAccel && forwardVel && forwardPos) {
+    st.punch_on = true; st.tPunch = now;
   } else if (st.punch_on &&
              (now - st.tPunch > HOLD_MS) &&
              ((lx < THRESH_X_OFF_MS2) || (st.px < POS_OFF_M))) {
     st.punch_on = false;
-    // Optional: reset integrators a bit to avoid immediate retriggering
-    st.vx *= 0.2f;
-    st.px *= 0.5f;
-  } else {
-    // If not punching, gently relax back toward zero to reduce bias
-    if (!st.punch_on) {
-      st.vx *= kv;
-      st.px *= kp;
-    }
+    st.vx *= 0.2f; st.px *= 0.5f;
+  } else if (!st.punch_on) {
+    st.vx *= kv; st.px *= kp;
   }
 
-  // Drive LED (blink while active)
+  // Drive LED (solid while active)
   if (st.punch_on) setFwdLED(isA, true, now);
   else             clearFwdLEDs(isA);
 
-  // Debug
-  Serial.print(tag);
-  Serial.print(" lx:"); Serial.print(lx,2);
-  Serial.print(" ly:"); Serial.print(ly,2);
-  Serial.print(" lz:"); Serial.print(lz,2);
-  Serial.print(" | |a|:"); Serial.print(amag,2);
-  Serial.print(" | vx:"); Serial.print(st.vx,2);
-  Serial.print(" px:");  Serial.print(st.px*100.0f,1); // cm
-  if (st.punch_on) Serial.print("  <-- +X PUNCH (accel+pos)");
-  Serial.println();
+  // Debug (every ~50 ms)
+  unsigned long* last = isA ? &lastDbgA : &lastDbgB;
+  if (millis() - *last >= 50) {
+    *last = millis();
+    Serial.print(tag);
+    Serial.print(" raw:"); Serial.print(ax,2); Serial.print(','); Serial.print(ay,2); Serial.print(','); Serial.print(az,2);
+    Serial.print(" | g:");  Serial.print(st.gx,2); Serial.print(','); Serial.print(st.gy,2); Serial.print(','); Serial.print(st.gz,2);
+    Serial.print(" | lx:"); Serial.print(lx,2);
+    Serial.print(" ly:");   Serial.print(ly,2);
+    Serial.print(" lz:");   Serial.print(lz,2);
+    Serial.print(" | |a|:"); Serial.print(amag,2);
+    Serial.print(" | vx:"); Serial.print(st.vx,2);
+    Serial.print(" px:");   Serial.print(st.px,2);
+    Serial.print(" vxb:");  Serial.print(st.vx_pb,2);  // >>> pull-back velocity debug
+    Serial.print(" pbx:");  Serial.print(st.pbx,2);    // >>> pull-back displacement debug
+    Serial.print(" | dt_ms:"); Serial.print(dt*1000.0f,1);
+    if (st.punch_on) Serial.print("  <-- +X PUNCH");
+    Serial.println();
+  }
 }
 
 void setup() {
@@ -328,21 +395,16 @@ void setup() {
   pinMode(LED_A_FWD, OUTPUT);
   pinMode(LED_B_FWD, OUTPUT);
   pinMode(LED_PULL_BACK, OUTPUT);
-  digitalWrite(LED_PULL_BACK, LOW);
-  clearFwdLEDs(true);
-  clearFwdLEDs(false);
+  digitalWrite(LED_PULL_BACK, LOW);  // active-HIGH: OFF at boot
+  clearFwdLEDs(true); clearFwdLEDs(false);
 
   for (int i = 0; i < 4; ++i) pinMode(BCD_PINS[i], OUTPUT);
   pinMode(EN_A, OUTPUT);
   pinMode(EN_B, OUTPUT);
 
   // Startup blink
-  for (int i=0; i<3; i++) {
-    digitalWrite(LED_BLINK, HIGH); delay(200);
-    digitalWrite(LED_BLINK, LOW); delay(200);
-  }
+  for (int i=0; i<3; i++) { digitalWrite(LED_BLINK, HIGH); delay(200); digitalWrite(LED_BLINK, LOW); delay(200); }
 
-  // Initialize MPUs
   bool okA = beginMPU(mpuA, ADDR_A, "MPU A");
   bool okB = beginMPU(mpuB, ADDR_B, "MPU B");
 
@@ -352,9 +414,8 @@ void setup() {
   if (!okA) { hA.healthy = false; hA.failCount = HEALTH_FAIL_LIMIT; }
   if (!okB) { hB.healthy = false; hB.failCount = HEALTH_FAIL_LIMIT; }
 
-  // Seed gravity/kinematics immediately for healthy sensors
-  if (hA.healthy) seedGravity(mpuA, sA, "A");
-  if (hB.healthy) seedGravity(mpuB, sB, "B");
+  if (hA.healthy) seedGravity(mpuA, sA, "A", ORIENT_A);
+  if (hB.healthy) seedGravity(mpuB, sB, "B", ORIENT_B);
 
   Serial.println("Health monitor active: WHO_AM_I checks + fast-blink on failure");
   delay(100);
@@ -364,41 +425,26 @@ void loop() {
   unsigned long now = millis();
 
   static uint32_t t = 0;
-  static uint8_t left = 0, right = 0; // start at 00
+  static uint8_t left = 0, right = 0;
 
-  // Increment digits every 500 ms
-  if (millis() - t > 500) {
-    t = millis();
-    left = (left + 1) % 10;
-    right = (right + 1) % 10;
-  }
-
-  // Alternate every ~2 ms -> per-digit 250 Hz if loop keeps up
-  bool showLeft = (micros() / 200) % 2 == 0; // switches every 500 microseconds (~1 kHz)
+  if (millis() - t > 500) { t = millis(); left = (left + 1) % 10; right = (right + 1) % 10; }
+  bool showLeft = (micros() / 200) % 2 == 0;
   showDigitAB(left, right, showLeft);
 
-  // Periodic health checks
-  if (now - hA.lastCheck >= HEALTH_PERIOD_MS) {
-    hA.lastCheck = now;
-    checkHealth(ADDR_A, hA, "MPU A");
-  }
-  if (now - hB.lastCheck >= HEALTH_PERIOD_MS) {
-    hB.lastCheck = now;
-    checkHealth(ADDR_B, hB, "MPU B");
-  }
+  if (now - hA.lastCheck >= HEALTH_PERIOD_MS) { hA.lastCheck = now; checkHealth(ADDR_A, hA, "MPU A"); }
+  if (now - hB.lastCheck >= HEALTH_PERIOD_MS) { hB.lastCheck = now; checkHealth(ADDR_B, hB, "MPU B"); }
 
-  // Failure indication: blink forward LEDs
   bool aFailBlink = (!hA.healthy) && ((now / FAIL_BLINK_MS) % 2);
   bool bFailBlink = (!hB.healthy) && ((now / FAIL_BLINK_MS) % 2);
-
   if (!hA.healthy) digitalWrite(LED_A_FWD, aFailBlink ? HIGH : LOW);
   if (!hB.healthy) digitalWrite(LED_B_FWD, bFailBlink ? HIGH : LOW);
 
-  // Only process healthy sensors for punch/X-axis logic
-  if (hA.healthy) punch(mpuA, sA, "A", true);
-  if (hB.healthy) punch(mpuB, sB, "B", false);
+  if (wantReseedA && hA.healthy) { wantReseedA = false; seedGravity(mpuA, sA, "A (auto-reseed)", ORIENT_A); }
+  if (wantReseedB && hB.healthy) { wantReseedB = false; seedGravity(mpuB, sB, "B (auto-reseed)", ORIENT_B); }
 
-  // New: evaluate separate "pull back" feature (may override LED 6 while active)
+  if (hA.healthy) punch(mpuA, sA, "A", true,  ORIENT_A);
+  if (hB.healthy) punch(mpuB, sB, "B", false, ORIENT_B);
+
   updatePullBack(sA, sB, hA, hB, now);
   // delay(20);
 }
