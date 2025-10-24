@@ -27,7 +27,7 @@ float alpha = 0.98f; // gravity LPF factor
 const uint16_t HOLD_MS = 150;    // LED hold after trigger (ms)
 
 // X-axis thresholds (m/s^2)
-const float THRESH_X_ON_MS2  =10.0f;
+const float THRESH_X_ON_MS2  = 12.0f;
 const float THRESH_X_OFF_MS2 = 1.2f;
 
 // Punch displacement gates (meters, forward = +X)
@@ -77,9 +77,31 @@ const float BACK_X_ON_MS2  = -8.0f;
 const float BACK_X_OFF_MS2 = -4.0f;
 const uint16_t PULLBACK_HOLD_MS = 120;
 
-// >>> pull-back position thresholds (meters, NEGATIVE for back)
-const float PB_POS_ON_M  = -0.05f;  // ≈ 5 cm behind start
-const float PB_POS_OFF_M = -0.035f; // ≈ 3.5 cm (hysteresis)
+// pull-back position thresholds (meters, NEGATIVE for back)
+const float PB_POS_ON_M  = -0.03f;   // was -0.05f  (turn ON ≈ 3 cm back)
+const float PB_POS_OFF_M = -0.02f;   // was -0.035f (turn OFF ≈ 2 cm back)
+
+// --- Guard-pose option (Y/Z agreement). Leave OFF to use X-only pull-back ---
+// If false: LED depends only on X displacement (PB_POS_* thresholds).
+// If true : LED also requires pose agreement (mirrored gravities) with hysteresis.
+const bool USE_GUARD_POSE = false;   // <- set true to re-enable Y/Z checks
+
+// Guard-pose gating (angle + hysteresis + smoothing)
+// extremely loose (~70°–75° cone)
+const float GUARD_COS_ON  = 0.35f;
+const float GUARD_COS_OFF = 0.25f;
+const float GUARD_COS_ALPHA = 0.80f;  // LPF on cos(angle) (0.8 = fairly sticky)
+const float LX_POSE_THR    = 0.6f;    // m/s^2 max |lx| to consider "quiet"
+
+// Reverse-punch (backward accel) thresholds — much lower than punch
+const float BACK_ON_MS2  = -3.5f;   // trigger when lx <= this
+const float BACK_OFF_MS2 = -1.5f;   // release when lx >= this
+const uint16_t BACK_HOLD_MS = 120;  // minimal "active" hold to get overlap
+
+// Guard state
+bool   guard_on  = false;
+float  cos_lpf   = 1.0f;              // filtered cos(angle) between gravities
+
 
 // physical forward previously read as −X; flip X so forward ⇒ +X
 const int8_t ORIENT_A[9] = {
@@ -180,13 +202,18 @@ static inline void mapAccel(const sensors_event_t &a, const int8_t M[9],
 bool i2cReadReg8(uint8_t addr, uint8_t reg, uint8_t &val) {
   Wire.beginTransmission(addr);
   Wire.write(reg);
-  uint8_t tx = Wire.endTransmission(false);
+  uint8_t tx = Wire.endTransmission(false); // repeated start
   if (tx != 0) return false;
+
+  uint32_t t0 = micros();
   uint8_t n = Wire.requestFrom((int)addr, 1, (int)true);
-  if (n != 1) return false;
+  while (Wire.available() < 1) {           // simple timeout loop
+    if ((micros() - t0) > 25000) return false; // 25 ms
+  }
   val = Wire.read();
-  return true;
+  return (n == 1);
 }
+
 
 void checkHealth(uint8_t addr, HealthState &hs, const char *tag) {
   uint8_t v = 0x00;
@@ -230,34 +257,90 @@ void seedGravity(Adafruit_MPU6050 &mpu, GravState &st, const char *tag, const in
   sensors_event_t a, g, temp;
   const int N = 50;
   float sx = 0, sy = 0, sz = 0;
-  for (int i=0; i<N; i++) {
-    mpu.getEvent(&a, &g, &temp);
+
+  unsigned long t0 = millis();
+  int n = 0;
+  while (n < N) {
+    // timeout ~200 ms total, then use what we got
+    if (millis() - t0 > 200) break;
+    if (!mpu.getEvent(&a, &g, &temp)) continue; // skip if read failed
     float ax, ay, az; mapAccel(a, ORIENT, ax, ay, az);
     sx += ax; sy += ay; sz += az;
+    n++;
     delay(2);
   }
-  st.gx = sx / N; st.gy = sy / N; st.gz = sz / N;
-  st.vx = 0.0f; st.px = 0.0f;
-  st.vx_pb = 0.0f; st.pbx = 0.0f;  // >>> pull-back: reset dedicated path
+  if (n == 0) { // fallback seed from last read or nominal gravity on Z
+    st.gx = 0; st.gy = 0; st.gz = G_NOMINAL;
+  } else {
+    st.gx = sx / n; st.gy = sy / n; st.gz = sz / n;
+  }
+  st.vx = st.px = 0.0f;
+  st.vx_pb = 0.0f; st.pbx = 0.0f;
   st.tLast = millis();
   st.g_init = true;
-  Serial.print(tag); Serial.println(" gravity/kinematics seeded (avg)");
+  Serial.print(tag); Serial.print(" gravity/kinematics seeded (avg n="); Serial.print(n); Serial.println(")");
 }
 
+
 // ACTIVE-HIGH LED: HIGH = ON, LOW = OFF
-void updatePullBack(const GravState &sa, const GravState &sb,
-                    const HealthState &ha, const HealthState &hb,
-                    unsigned long now) {
-  // LED OFF if either sensor is unhealthy
+void guard(const GravState &sa, const GravState &sb,
+           const HealthState &ha, const HealthState &hb,
+           unsigned long now) {
+  // OFF if either sensor is unhealthy
   if (!(ha.healthy && hb.healthy)) {
+    guard_on = false;
     digitalWrite(LED_PULL_BACK, LOW);
     return;
   }
 
-  // Stateless gate: ON while both are behind -5 cm, OFF otherwise
-  const bool bothBackNow = (sa.pbx <= PB_POS_ON_M) && (sb.pbx <= PB_POS_ON_M);
-  digitalWrite(LED_PULL_BACK, bothBackNow ? HIGH : LOW);
+  // --- per-sensor reverse-punch (backward accel) state ---
+  static bool a_on = false, b_on = false;
+  static unsigned long ta = 0, tb = 0;
+
+  auto updateBack = [&](const GravState& s, bool &on, unsigned long &t){
+    // ON when lx <= BACK_ON_MS2
+    if (!on) {
+      if (s.lx_last <= BACK_ON_MS2) { on = true; t = now; }
+      return;
+    }
+    // When ON, keep it held for BACK_HOLD_MS; after that, allow OFF on lx >= BACK_OFF_MS2
+    if ((now - t) >= BACK_HOLD_MS && s.lx_last >= BACK_OFF_MS2) {
+      on = false;
+    }
+  };
+
+  updateBack(sa, a_on, ta);
+  updateBack(sb, b_on, tb);
+
+  bool bothBack = a_on && b_on;
+
+  // Optional: layer the (very loose) pose agreement on top if enabled
+  if (USE_GUARD_POSE) {
+    // Build mirrored gravity vectors (mirror B's Y)
+    float axg = sa.gx, ayg = sa.gy, azg = sa.gz;
+    float bxg = sb.gx, byg = -sb.gy, bzg = sb.gz;
+
+    auto vmag = [](float x,float y,float z){ return sqrtf(x*x+y*y+z*z); };
+    float ma = vmag(axg,ayg,azg); if (ma < 1e-3f) ma = 1.0f;
+    float mb = vmag(bxg,byg,bzg); if (mb < 1e-3f) mb = 1.0f;
+    axg/=ma; ayg/=ma; azg/=ma;  bxg/=mb; byg/=mb; bzg/=mb;
+
+    float cosang = axg*bxg + ayg*byg + azg*bzg;
+    cos_lpf = GUARD_COS_ALPHA * cos_lpf + (1.0f - GUARD_COS_ALPHA) * cosang;
+
+    // Keep existing hysteresis on the pose gate
+    if (!guard_on)  guard_on = (bothBack && (cos_lpf >= GUARD_COS_ON));
+    else            guard_on = (bothBack && (cos_lpf >= GUARD_COS_OFF));
+  } else {
+    // Pure reverse-punch logic (no pose)
+    guard_on = bothBack;
+  }
+
+  digitalWrite(LED_PULL_BACK, guard_on ? HIGH : LOW);
 }
+
+
+
 
 // ------- 1D kinematics helpers (decay factors per dt) -------
 static inline float decayFactor(float dt_s, float tau_s) {
@@ -268,7 +351,8 @@ static inline float decayFactor(float dt_s, float tau_s) {
 }
 
 // Process one sensor when healthy
-void punch(Adafruit_MPU6050 &mpu, GravState &st, const char *tag, bool isA, const int8_t ORIENT[9]) {
+void punch(Adafruit_MPU6050 &mpu, GravState &st, HealthState &hs, const char *tag, bool isA, const int8_t ORIENT[9]) {
+  if (!hs.healthy) return; // skip processing if unhealthy
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
 
@@ -363,33 +447,39 @@ void punch(Adafruit_MPU6050 &mpu, GravState &st, const char *tag, bool isA, cons
   }
 
   // Drive LED (solid while active)
-  if (st.punch_on) setFwdLED(isA, true, now);
-  else             clearFwdLEDs(isA);
-
-  // Debug (every ~50 ms)
-  unsigned long* last = isA ? &lastDbgA : &lastDbgB;
-  if (millis() - *last >= 50) {
-    *last = millis();
-    Serial.print(tag);
-    Serial.print(" raw:"); Serial.print(ax,2); Serial.print(','); Serial.print(ay,2); Serial.print(','); Serial.print(az,2);
-    Serial.print(" | g:");  Serial.print(st.gx,2); Serial.print(','); Serial.print(st.gy,2); Serial.print(','); Serial.print(st.gz,2);
-    Serial.print(" | lx:"); Serial.print(lx,2);
-    Serial.print(" ly:");   Serial.print(ly,2);
-    Serial.print(" lz:");   Serial.print(lz,2);
-    Serial.print(" | |a|:"); Serial.print(amag,2);
-    Serial.print(" | vx:"); Serial.print(st.vx,2);
-    Serial.print(" px:");   Serial.print(st.px,2);
-    Serial.print(" vxb:");  Serial.print(st.vx_pb,2);  // >>> pull-back velocity debug
-    Serial.print(" pbx:");  Serial.print(st.pbx,2);    // >>> pull-back displacement debug
-    Serial.print(" | dt_ms:"); Serial.print(dt*1000.0f,1);
-    if (st.punch_on) Serial.print("  <-- +X PUNCH");
-    Serial.println();
+  if (st.punch_on) {
+    setFwdLED(isA, true, now);
   }
+  else {
+    clearFwdLEDs(isA);
+  }
+
+  // // Debug (every ~50 ms)
+  // unsigned long* last = isA ? &lastDbgA : &lastDbgB;
+  // if (millis() - *last >= 50) {
+  //   *last = millis();
+  //   // Serial.print(tag);
+  //   // Serial.print(" raw:"); Serial.print(ax,2); Serial.print(','); Serial.print(ay,2); Serial.print(','); Serial.print(az,2);
+  //   // Serial.print(" | g:");  Serial.print(st.gx,2); Serial.print(','); Serial.print(st.gy,2); Serial.print(','); Serial.print(st.gz,2);
+  //   // Serial.print(" | lx:"); Serial.print(lx,2);
+  //   // Serial.print(" ly:");   Serial.print(ly,2);
+  //   // Serial.print(" lz:");   Serial.print(lz,2);
+  //   // Serial.print(" | |a|:"); Serial.print(amag,2);
+  //   // Serial.print(" | vx:"); Serial.print(st.vx,2);
+  //   // Serial.print(" px:");   Serial.print(st.px,2);
+  //   // Serial.print(" vxb:");  Serial.print(st.vx_pb,2);  // >>> pull-back velocity debug
+  //   // Serial.print(" pbx:");  Serial.print(st.pbx,2);    // >>> pull-back displacement debug
+  //   // Serial.print(" | dt_ms:"); Serial.print(dt*1000.0f,1);
+  //   if (st.punch_on) Serial.println("  <-- +X PUNCH");
+  //   // Serial.println();
+  // }
 }
 
 void setup() {
   Serial.begin(115200);
   Wire.begin();
+  Wire.setClock(400000);            // 400 kHz I2C
+  Wire.setWireTimeout(25000, true); // 25 ms timeout, auto reset bus on timeout
 
   pinMode(LED_BLINK, OUTPUT);
   pinMode(LED_A_FWD, OUTPUT);
@@ -408,11 +498,11 @@ void setup() {
   bool okA = beginMPU(mpuA, ADDR_A, "MPU A");
   bool okB = beginMPU(mpuB, ADDR_B, "MPU B");
 
-  checkHealth(ADDR_A, hA, "MPU A");
-  checkHealth(ADDR_B, hB, "MPU B");
-
-  if (!okA) { hA.healthy = false; hA.failCount = HEALTH_FAIL_LIMIT; }
-  if (!okB) { hB.healthy = false; hB.failCount = HEALTH_FAIL_LIMIT; }
+  // Assume health from begin(); periodic checks in loop() will correct this
+  hA.healthy = okA;
+  hB.healthy = okB;
+  hA.failCount = okA ? 0 : HEALTH_FAIL_LIMIT;
+  hB.failCount = okB ? 0 : HEALTH_FAIL_LIMIT;
 
   if (hA.healthy) seedGravity(mpuA, sA, "A", ORIENT_A);
   if (hB.healthy) seedGravity(mpuB, sB, "B", ORIENT_B);
@@ -442,9 +532,9 @@ void loop() {
   if (wantReseedA && hA.healthy) { wantReseedA = false; seedGravity(mpuA, sA, "A (auto-reseed)", ORIENT_A); }
   if (wantReseedB && hB.healthy) { wantReseedB = false; seedGravity(mpuB, sB, "B (auto-reseed)", ORIENT_B); }
 
-  if (hA.healthy) punch(mpuA, sA, "A", true,  ORIENT_A);
-  if (hB.healthy) punch(mpuB, sB, "B", false, ORIENT_B);
+  punch(mpuA, sA, hA, "A", true,  ORIENT_A);
+  punch(mpuB, sB, hB, "B", false, ORIENT_B);
 
-  updatePullBack(sA, sB, hA, hB, now);
+  guard(sA, sB, hA, hB, now);
   // delay(20);
 }
