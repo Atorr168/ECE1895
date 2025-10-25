@@ -96,7 +96,7 @@ const uint8_t LED_PASS = 6;     // temp led for pass fail, and MPU A init
 const uint8_t LED_FAIL = 7;     // temp led for pass fail, and MPU B init
 
 // BCD bus (share to both 7447s)
-const uint8_t BCD_PINS[4] = {2, 3, 4, 8}; // A,B,C,D (choose any free pins)
+const uint8_t BCD_PINS[4] = {2, 3, 4, 5}; // A,B,C,D (choose any free pins)
 
 // Per-digit enables to 7447 BI/ pins (active LOW to blank)
 const uint8_t EN_A = 13;  // -> BI/_A
@@ -151,12 +151,12 @@ bool wantReseedA = false, wantReseedB = false;
 
 int score = 0;
 
-const uint8_t TEMP_LED1 = 9;   // shows "01" (A)
-const uint8_t TEMP_LED2 = 10;  // shows "10" (B)
+const uint8_t TEMP_LED1 = 0;   // shows "01" (A)
+const uint8_t TEMP_LED2 = 1;  // shows "10" (B)
 
-inline void setTempLEDs(bool l9, bool l10) {
-  digitalWrite(TEMP_LED1, l9 ? HIGH : LOW);
-  digitalWrite(TEMP_LED2, l10 ? HIGH : LOW);
+inline void setTempLEDs(bool left, bool right) {
+  digitalWrite(TEMP_LED1, left ? HIGH : LOW);
+  digitalWrite(TEMP_LED2, right ? HIGH : LOW);
 }
 
 // Demo sequence state
@@ -293,10 +293,10 @@ void checkHealth(uint8_t addr, HealthState &hs, const char *tag) {
     if (hs.failCount < 255) hs.failCount++;
     if (hs.failCount >= HEALTH_FAIL_LIMIT && hs.healthy) {
       hs.healthy = false;
-      Serial.print(tag); Serial.println(" unhealthy (WHO_AM_I failed)");
+      // Serial.print(tag); Serial.println(" unhealthy (WHO_AM_I failed)");
     }
   } else {
-    if (!hs.healthy) { Serial.print(tag); Serial.println(" recovered"); }
+    // if (!hs.healthy) { Serial.print(tag); Serial.println(" recovered"); }
     hs.healthy = true;
     hs.failCount = 0;
   }
@@ -304,7 +304,7 @@ void checkHealth(uint8_t addr, HealthState &hs, const char *tag) {
 
 bool beginMPU(Adafruit_MPU6050 &mpu, uint8_t addr, const char *tag) {
   if (!mpu.begin(addr)) {
-    Serial.print(tag); Serial.println(" begin() failed");
+    // Serial.print(tag); Serial.println(" begin() failed");
     return false;
   }
   mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
@@ -345,7 +345,7 @@ void seedGravity(Adafruit_MPU6050 &mpu, GravState &st, const char *tag, const in
   st.vx_pb = 0.0f; st.pbx = 0.0f;
   st.tLast = millis();
   st.g_init = true;
-  Serial.print(tag); Serial.print(" gravity/kinematics seeded (avg n="); Serial.print(n); Serial.println(")");
+  // Serial.print(tag); Serial.print(" gravity/kinematics seeded (avg n="); Serial.print(n); Serial.println(")");
 }
 
 inline void displaySet(uint8_t left, uint8_t right) {
@@ -398,53 +398,31 @@ void resetGameAndSeed() {
 void guard(const GravState &sa, const GravState &sb,
            const HealthState &ha, const HealthState &hb,
            unsigned long now) {
-  // OFF if either sensor is unhealthy
-  if (!(ha.healthy && hb.healthy)) {
-    guard_on = false;
-    // digitalWrite(LED_PULL_BACK, LOW);
-    return;
-  }
+  if (!(ha.healthy && hb.healthy)) { guard_on = false; return; }
 
-  // --- per-sensor reverse-punch (backward accel) state ---
-  static bool a_on = false, b_on = false;
-  static unsigned long ta = 0, tb = 0;
+  // Both must be concurrently "back" for BACK_HOLD_MS to latch guard_on
+  bool bothBackNow = (sa.lx_last <= BACK_ON_MS2) && (sb.lx_last <= BACK_ON_MS2);
+  static unsigned long tBothStart = 0;
 
-  auto updateBack = [&](const GravState& s, bool &on, unsigned long &t){
-    if (!on) {
-      if (s.lx_last <= BACK_ON_MS2) { on = true; t = now; }
-      return;
+  if (!guard_on) {
+    if (bothBackNow) {
+      if (tBothStart == 0) tBothStart = now;
+      if ((now - tBothStart) >= BACK_HOLD_MS) guard_on = true;
+    } else {
+      tBothStart = 0; // reset if either side not back
     }
-    if ((now - t) >= BACK_HOLD_MS && s.lx_last >= BACK_OFF_MS2) {
-      on = false;
-    }
-  };
-
-  updateBack(sa, backA_on, tBackA);
-  updateBack(sb, backB_on, tBackB);
-
-  bool bothBack = backA_on && backB_on;
-
-  if (USE_GUARD_POSE) {
-    // Build mirrored gravity vectors (mirror B's Y)
-    float axg = sa.gx, ayg = sa.gy, azg = sa.gz;
-    float bxg = sb.gx, byg = -sb.gy, bzg = sb.gz;
-
-    auto vmag = [](float x,float y,float z){ return sqrtf(x*x+y*y+z*z); };
-    float ma = vmag(axg,ayg,azg); if (ma < 1e-3f) ma = 1.0f;
-    float mb = vmag(bxg,byg,bzg); if (mb < 1e-3f) mb = 1.0f;
-    axg/=ma; ayg/=ma; azg/=ma;  bxg/=mb; byg/=mb; bzg/=mb;
-
-    float cosang = axg*bxg + ayg*byg + azg*bzg;
-    cos_lpf = GUARD_COS_ALPHA * cos_lpf + (1.0f - GUARD_COS_ALPHA) * cosang;
-
-    if (!guard_on)  guard_on = (bothBack && (cos_lpf >= GUARD_COS_ON));
-    else            guard_on = (bothBack && (cos_lpf >= GUARD_COS_OFF));
   } else {
-    guard_on = bothBack;
+    // Once latched, release as soon as either side exits the back zone
+    // (use hysteresis and immediate drop on forward accel)
+    bool releaseA = (sa.lx_last >= BACK_OFF_MS2) || (sa.lx_last > 0.0f);
+    bool releaseB = (sb.lx_last >= BACK_OFF_MS2) || (sb.lx_last > 0.0f);
+    if (releaseA || releaseB) {
+      guard_on = false;
+      tBothStart = 0;
+    }
   }
-
-  // digitalWrite(LED_PULL_BACK, guard_on ? HIGH : LOW);
 }
+
 
 // ------- 1D kinematics helpers (decay factors per dt) -------
 static inline float decayFactor(float dt_s, float tau_s) {
@@ -557,7 +535,7 @@ void punch(Adafruit_MPU6050 &mpu, GravState &st, HealthState &hs, bool isA, cons
 }
 
 void setup() {
-  Serial.begin(115200);
+  // Serial.begin(115200);
   Wire.begin();
   Wire.setClock(400000);
   Wire.setWireTimeout(25000, true);
@@ -603,7 +581,7 @@ void setup() {
   // if (hA.healthy) seedGravity(...);
   // if (hB.healthy) seedGravity(...);
 
-  Serial.println("Press START to begin (3-2-1-0 then seed).");
+  // Serial.println("Press START to begin (3-2-1-0 then seed).");
   delay(100);
 }
 
@@ -632,24 +610,38 @@ void loop() {
   if (now - hA.lastCheck >= HEALTH_PERIOD_MS) { hA.lastCheck = now; checkHealth(ADDR_A, hA, "MPU A"); }
   if (now - hB.lastCheck >= HEALTH_PERIOD_MS) { hB.lastCheck = now; checkHealth(ADDR_B, hB, "MPU B"); }
 
-  // end pulses when time is up
-  if (pass_pulse && (long)(now - pass_until) >= 0) {
+  // ---- Game-over FAIL blink override ----
+  bool isGameOverBlink = (demo_phase == DEMO_DONE && game_over);
+  if (isGameOverBlink) {
+    // Ignore any leftover pass/fail pulses and health status while blinking
     pass_pulse = false;
-    digitalWrite(LED_PASS, LOW);
-  }
-  if (fail_pulse && (long)(now - fail_until) >= 0) {
     fail_pulse = false;
-    digitalWrite(LED_FAIL, LOW);
+    digitalWrite(LED_PASS, LOW);
+    bool on = ((now / GAMEOVER_BLINK_MS) % 2);
+    digitalWrite(LED_FAIL, on ? HIGH : LOW);
   }
 
-  // If no active pulse, fall back to health blink status
-  if (!pass_pulse) {
-    bool aFailBlink = (!hA.healthy) && ((now / FAIL_BLINK_MS) % 2);
-    digitalWrite(LED_PASS, aFailBlink ? HIGH : LOW);
-  }
-  if (!fail_pulse) {
-    bool bFailBlink = (!hB.healthy) && ((now / FAIL_BLINK_MS) % 2);
-    digitalWrite(LED_FAIL, bFailBlink ? HIGH : LOW);
+
+  // end pulses when time is up (only if not in game-over blink)
+  if (!isGameOverBlink) {
+    if (pass_pulse && (long)(now - pass_until) >= 0) {
+      pass_pulse = false;
+      digitalWrite(LED_PASS, LOW);
+    }
+    if (fail_pulse && (long)(now - fail_until) >= 0) {
+      fail_pulse = false;
+      digitalWrite(LED_FAIL, LOW);
+    }
+
+    // If no active pulse, fall back to health blink status
+    if (!pass_pulse) {
+      bool aFailBlink = (!hA.healthy) && ((now / FAIL_BLINK_MS) % 2);
+      digitalWrite(LED_PASS, aFailBlink ? HIGH : LOW);
+    }
+    if (!fail_pulse) {
+      bool bFailBlink = (!hB.healthy) && ((now / FAIL_BLINK_MS) % 2);
+      digitalWrite(LED_FAIL, bFailBlink ? HIGH : LOW);
+    }
   }
 
   // If not started, force LEDs off and DON'T update kinematics
