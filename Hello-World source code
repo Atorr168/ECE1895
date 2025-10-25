@@ -87,10 +87,9 @@ inline bool startPressed() {
   return false;
 }
 
-const uint8_t LED_PULL_BACK = 5;
-// Forward (+X) LEDs only
-const uint8_t LED_A_FWD = 6;     // forward for MPU A
-const uint8_t LED_B_FWD = 7;     // forward for MPU B
+// const uint8_t LED_PULL_BACK = 5;
+const uint8_t LED_PASS = 6;     // temp led for pass fail, and MPU A init
+const uint8_t LED_FAIL = 7;     // temp led for pass fail, and MPU B init
 
 // BCD bus (share to both 7447s)
 const uint8_t BCD_PINS[4] = {2, 3, 4, 8}; // A,B,C,D (choose any free pins)
@@ -148,8 +147,60 @@ bool wantReseedA = false, wantReseedB = false;
 
 int score = 0;
 
+// Demo sequence state
+bool demo_active = false;
+unsigned long demo_t0 = 0;
+
+// --- Demo phases ---
+enum DemoPhase : uint8_t {
+  DEMO_IDLE = 0,
+  DEMO_A_ON,     // LEDs = 01 (punch A)
+  DEMO_A_BREAK,  // LEDs off
+  DEMO_B_ON,     // LEDs = 10 (punch B)
+  DEMO_B_BREAK,  // LEDs off
+  DEMO_PB_ON,    // LEDs = 11 (pull-back)
+  DEMO_DONE
+};
+
+const unsigned long DEMO_ON_MS    = 10000UL; // 10s lit
+const unsigned long DEMO_BREAK_MS = 10000UL; // 10s off
+
 volatile uint8_t disp_left  = 0;
 volatile uint8_t disp_right = 0;
+
+const uint8_t TEMP_LED1 = 9;   // shows "01" (A)
+const uint8_t TEMP_LED2 = 10;  // shows "10" (B)
+
+DemoPhase demo_phase = DEMO_IDLE;
+unsigned long phase_t0 = 0;
+bool phase_met = false;         // was the required action seen during ON?
+
+// edge detectors (so we count "at least once")
+bool prevPunchA = false;
+bool prevPunchB = false;
+bool prevGuard  = false;
+
+
+inline void setTempLEDs(bool l9, bool l10) {
+  digitalWrite(TEMP_LED1, l9 ? HIGH : LOW);
+  digitalWrite(TEMP_LED2, l10 ? HIGH : LOW);
+}
+
+// --- PASS/FAIL 1s pulse state ---
+bool pass_pulse = false, fail_pulse = false;
+unsigned long pass_until = 0, fail_until = 0;
+
+// fire-and-forget helpers
+inline void triggerPass() {
+  pass_pulse = true;
+  pass_until = millis() + 1000UL;  // 1 second
+  digitalWrite(LED_PASS, HIGH);
+}
+inline void triggerFail() {
+  fail_pulse = true;
+  fail_until = millis() + 1000UL;  // 1 second
+  digitalWrite(LED_FAIL, HIGH);
+}
 
 
 ISR(TIMER2_COMPA_vect) {
@@ -166,8 +217,8 @@ ISR(TIMER2_COMPA_vect) {
   for (int i = 0; i < 4; ++i) digitalWrite(BCD_PINS[i], (val >> i) & 1);
 
   // Enable the selected digit (BI/ HIGH = show)
-  if (showLeft) digitalWrite(EN_A, HIGH);
-  else          digitalWrite(EN_B, HIGH);
+  if (showLeft) digitalWrite(EN_B, HIGH);
+  else          digitalWrite(EN_A, HIGH);
 }
 
 
@@ -252,11 +303,11 @@ bool beginMPU(Adafruit_MPU6050 &mpu, uint8_t addr, const char *tag) {
 }
 
 // ---- LED helpers ----
-void setFwdLED(bool isA, bool on) {
-  if (isA) digitalWrite(LED_A_FWD, on ? HIGH : LOW);
-  else     digitalWrite(LED_B_FWD, on ? HIGH : LOW);
-}
-void clearFwdLEDs(bool isA) { if (isA) digitalWrite(LED_A_FWD, LOW); else digitalWrite(LED_B_FWD, LOW); }
+// void setFwdLED(bool isA, bool on) {
+//   if (isA) digitalWrite(LED_A_FWD, on ? HIGH : LOW);
+//   else     digitalWrite(LED_B_FWD, on ? HIGH : LOW);
+// }
+// void clearFwdLEDs(bool isA) { if (isA) digitalWrite(LED_A_FWD, LOW); else digitalWrite(LED_B_FWD, LOW); }
 
 // --- averaged gravity seed to avoid seeding during micro-motion ---
 void seedGravity(Adafruit_MPU6050 &mpu, GravState &st, const char *tag, const int8_t ORIENT[9]) {
@@ -292,6 +343,8 @@ inline void displaySet(uint8_t left, uint8_t right) {
 }
 
 void resetGameAndSeed() {
+
+  score = 0;
   // 3-2-1-0 countdown, keep multiplexing alive while we wait ~1s per digit
   for (int d = 3; d >= 0; --d) {
     unsigned long end = millis() + 1000;
@@ -304,8 +357,8 @@ void resetGameAndSeed() {
   }
 
   // Clear LEDs & guard/reverse-punch state
-  clearFwdLEDs(true); clearFwdLEDs(false);
-  digitalWrite(LED_PULL_BACK, LOW);
+  // clearFwdLEDs(true); clearFwdLEDs(false);
+  // digitalWrite(LED_PULL_BACK, LOW);
   guard_on = false;
   backA_on = backB_on = false;
   tBackA = tBackB = 0;
@@ -314,7 +367,14 @@ void resetGameAndSeed() {
   if (hA.healthy) seedGravity(mpuA, sA, "A (restart)", ORIENT_A);
   if (hB.healthy) seedGravity(mpuB, sB, "B (restart)", ORIENT_B);
 
-  game_started = true;                // <<< now live
+  game_started = true;                // now live
+
+  // Start the guided demo phases
+  demo_phase = DEMO_A_ON;
+  phase_t0   = millis();
+  phase_met  = false;
+  setTempLEDs(true, false);           // "01" -> punch A
+  prevPunchA = prevPunchB = prevGuard = false; 
 }
 
 // ACTIVE-HIGH LED: HIGH = ON, LOW = OFF
@@ -324,7 +384,7 @@ void guard(const GravState &sa, const GravState &sb,
   // OFF if either sensor is unhealthy
   if (!(ha.healthy && hb.healthy)) {
     guard_on = false;
-    digitalWrite(LED_PULL_BACK, LOW);
+    // digitalWrite(LED_PULL_BACK, LOW);
     return;
   }
 
@@ -366,7 +426,7 @@ void guard(const GravState &sa, const GravState &sb,
     guard_on = bothBack;
   }
 
-  digitalWrite(LED_PULL_BACK, guard_on ? HIGH : LOW);
+  // digitalWrite(LED_PULL_BACK, guard_on ? HIGH : LOW);
 }
 
 // ------- 1D kinematics helpers (decay factors per dt) -------
@@ -470,9 +530,13 @@ void punch(Adafruit_MPU6050 &mpu, GravState &st, HealthState &hs, bool isA, cons
     st.vx *= kv; st.px *= kp;
   }
 
-  // Drive LED (solid while active)
-  if (st.punch_on) setFwdLED(isA, true);
-  else             clearFwdLEDs(isA);
+  // // Drive LED (solid while active)
+  // if (st.punch_on) {
+  //   setFwdLED(isA, true);
+  // }
+  // else{
+  //   clearFwdLEDs(isA);
+  // }            
 }
 
 void setup() {
@@ -481,11 +545,16 @@ void setup() {
   Wire.setClock(400000);
   Wire.setWireTimeout(25000, true);
 
-  pinMode(LED_A_FWD, OUTPUT);
-  pinMode(LED_B_FWD, OUTPUT);
-  pinMode(LED_PULL_BACK, OUTPUT);
-  digitalWrite(LED_PULL_BACK, LOW);
-  clearFwdLEDs(true); clearFwdLEDs(false);
+  pinMode(LED_PASS, OUTPUT);
+  pinMode(LED_FAIL, OUTPUT);
+  // pinMode(LED_PULL_BACK, OUTPUT);
+  pinMode(TEMP_LED1, OUTPUT);
+  pinMode(TEMP_LED2, OUTPUT);
+  setTempLEDs(false, false);
+  digitalWrite(LED_PASS, LOW);
+  digitalWrite(LED_FAIL, LOW);
+
+  // clearFwdLEDs(true); clearFwdLEDs(false);
 
   for (int i = 0; i < 4; ++i) pinMode(BCD_PINS[i], OUTPUT);
   pinMode(EN_A, OUTPUT);
@@ -530,31 +599,45 @@ void loop() {
 
   unsigned long now = millis();
 
-  // keep driving 7-seg regardless so it doesn’t go dark
-  bool showLeft = (micros() / 200) % 2 == 0;
-
-  // Before game starts, show 00; after start, show score (tens/ones)
+  // --- 7-seg always shows score (or 00 before start) ---
   if (!game_started) {
     displaySet(0, 0);
   } else {
-    uint8_t left  = (score / 10) % 10;  // tens
-    uint8_t right = score % 10;         // ones
-    displaySet(left, right);
+    uint8_t tens = (score / 10) % 10;
+    uint8_t ones = score % 10;
+    displaySet(tens, ones);
   }
+
+
+
   // Health checks can always run
   if (now - hA.lastCheck >= HEALTH_PERIOD_MS) { hA.lastCheck = now; checkHealth(ADDR_A, hA, "MPU A"); }
   if (now - hB.lastCheck >= HEALTH_PERIOD_MS) { hB.lastCheck = now; checkHealth(ADDR_B, hB, "MPU B"); }
 
-  // Blink fail LEDs even when idle
-  bool aFailBlink = (!hA.healthy) && ((now / FAIL_BLINK_MS) % 2);
-  bool bFailBlink = (!hB.healthy) && ((now / FAIL_BLINK_MS) % 2);
-  if (!hA.healthy) digitalWrite(LED_A_FWD, aFailBlink ? HIGH : LOW);
-  if (!hB.healthy) digitalWrite(LED_B_FWD, bFailBlink ? HIGH : LOW);
+  // end pulses when time is up
+  if (pass_pulse && (long)(now - pass_until) >= 0) {
+    pass_pulse = false;
+    digitalWrite(LED_PASS, LOW);
+  }
+  if (fail_pulse && (long)(now - fail_until) >= 0) {
+    fail_pulse = false;
+    digitalWrite(LED_FAIL, LOW);
+  }
+
+  // If no active pulse, fall back to health blink status
+  if (!pass_pulse) {
+    bool aFailBlink = (!hA.healthy) && ((now / FAIL_BLINK_MS) % 2);
+    digitalWrite(LED_PASS, aFailBlink ? HIGH : LOW);
+  }
+  if (!fail_pulse) {
+    bool bFailBlink = (!hB.healthy) && ((now / FAIL_BLINK_MS) % 2);
+    digitalWrite(LED_FAIL, bFailBlink ? HIGH : LOW);
+  }
 
   // If not started, force LEDs off and DON'T update kinematics
   if (!game_started) {
-    clearFwdLEDs(true); clearFwdLEDs(false);
-    digitalWrite(LED_PULL_BACK, LOW);
+    // clearFwdLEDs(true); clearFwdLEDs(false);
+    // digitalWrite(LED_PULL_BACK, LOW);
     // keep states inert until start
     sA.g_init = sB.g_init = false;     // prevent auto-seed in punch()
     return;
@@ -567,4 +650,118 @@ void loop() {
   punch(mpuA, sA, hA, true,  ORIENT_A);
   punch(mpuB, sB, hB, false, ORIENT_B);
   guard(sA, sB, hA, hB, now);
+
+  // --- Guided demo: check required actions and advance phases ---
+  if (demo_phase != DEMO_IDLE && demo_phase != DEMO_DONE) {
+    unsigned long nowMs = millis();
+    unsigned long elapsed = nowMs - phase_t0;
+
+    // detect edges (set true only when it turns on)
+    bool punchA_edge = (sA.punch_on && !prevPunchA);
+    bool punchB_edge = (sB.punch_on && !prevPunchB);
+    bool guard_edge  = (guard_on     && !prevGuard);
+
+    prevPunchA = sA.punch_on;
+    prevPunchB = sB.punch_on;
+    prevGuard  = guard_on;
+
+    switch (demo_phase) {
+      case DEMO_A_ON: { // want A punch ("01")
+        // EARLY EXIT on first correct or wrong edge
+        if (punchA_edge) { // correct
+          score++; triggerPass();
+          demo_phase = DEMO_A_BREAK;
+          phase_t0   = nowMs;
+          setTempLEDs(false, false);
+          break;
+        }
+        if (punchB_edge || guard_edge) { // wrong input while A expected
+          triggerFail();
+          demo_phase = DEMO_A_BREAK;
+          phase_t0   = nowMs;
+          setTempLEDs(false, false);
+          break;
+        }
+
+        // TIMEOUT path (no input during window)
+        if (elapsed >= DEMO_ON_MS) {
+          triggerFail();                 // nothing correct happened
+          demo_phase = DEMO_A_BREAK;
+          phase_t0   = nowMs;
+          setTempLEDs(false, false);
+        }
+      } break;
+
+      case DEMO_A_BREAK:
+        if (elapsed >= DEMO_BREAK_MS) {
+          demo_phase = DEMO_B_ON;
+          phase_t0   = nowMs;
+          setTempLEDs(false, true);      // expect B ("10")
+        }
+        break;
+
+      case DEMO_B_ON: { // want B punch ("10")
+        if (punchB_edge) { // correct
+          score++; triggerPass();
+          demo_phase = DEMO_B_BREAK;
+          phase_t0   = nowMs;
+          setTempLEDs(false, false);
+          break;
+        }
+        if (punchA_edge || guard_edge) { // wrong input while B expected
+          triggerFail();
+          demo_phase = DEMO_B_BREAK;
+          phase_t0   = nowMs;
+          setTempLEDs(false, false);
+          break;
+        }
+
+        if (elapsed >= DEMO_ON_MS) {
+          triggerFail();
+          demo_phase = DEMO_B_BREAK;
+          phase_t0   = nowMs;
+          setTempLEDs(false, false);
+        }
+      } break;
+
+      case DEMO_B_BREAK:
+        // wait for break
+        if (elapsed >= DEMO_BREAK_MS) {
+          demo_phase = DEMO_PB_ON;
+          phase_t0   = nowMs;
+          setTempLEDs(true, true);       // expect pull-back ("11")
+        }
+        break;
+
+      case DEMO_PB_ON: { // want pull-back (guard_on)
+        if (guard_edge) { // correct
+          score++; triggerPass();
+          demo_phase = DEMO_DONE;
+          phase_t0   = nowMs;
+          setTempLEDs(false, false);
+          break;
+        }
+        if (punchA_edge || punchB_edge) { // wrong input while PB expected
+          triggerFail();
+          demo_phase = DEMO_DONE;
+          phase_t0   = nowMs;
+          setTempLEDs(false, false);
+          break;
+        }
+
+        if (elapsed >= DEMO_ON_MS) {
+          triggerFail();
+          demo_phase = DEMO_DONE;
+          phase_t0   = nowMs;
+          setTempLEDs(false, false);
+        }
+      } break;
+
+      default:
+        break;
+    }
+
+
+  }
+
 }
