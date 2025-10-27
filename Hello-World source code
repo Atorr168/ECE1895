@@ -1,18 +1,12 @@
-// Dual MPU6050 with X-axis trigger + health monitoring (identify which MPU fails)
-// Now also requires forward DISPLACEMENT relative to initial pose, not just accel.
-// FIXES:
-//  - Proper per-sensor 3×3 orientation mapping (no ad-hoc X flip)
-//  - Averaged gravity seed
-//  - Freeze gravity LPF during high dynamics so it won't "learn" the shove
-//  - Separate kinematics for punch vs. pull-back (longer memory for pull-back)
-
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <Wire.h>
 #include <math.h>
 
 
-// ==== 1) Types FIRST (before any function that uses them) ====
+// idk why Arduino IDE needs these forward declarations
+
+// gravity + kinematics state for one sensor
 struct GravState {
   bool g_init = false;
   float gx = 0, gy = 0, gz = 0;
@@ -22,7 +16,6 @@ struct GravState {
   bool punch_on = false;
   unsigned long tPunch = 0;
   float lx_last = 0.0f;
-  // NEW:
   unsigned long rev_rearm_until = 0;
   float px_last = 0.0f;
 
@@ -31,92 +24,92 @@ struct GravState {
   float  px_at_arm = 0.0f;
 };
 
-
+// health state for one sensor
 struct HealthState {
   bool healthy = true;
   uint8_t failCount = 0;
   unsigned long lastCheck = 0;
 };
  
-// --- Demo phases ---
+// demo phases and targets
 enum DemoPhase : uint8_t { DEMO_IDLE = 0, DEMO_ON, DEMO_BREAK, DEMO_DONE };
 enum DemoTarget : uint8_t { TGT_A = 0, TGT_B = 1, TGT_PB = 2 };
 
-// ==== 2) Globals that use those types ====
-bool game_started = false;
+// Global States
 GravState sA, sB;
 HealthState hA, hB;
 
 
-// ----- I2C ADDRESSES -----
+// I2C addresses
 const uint8_t ADDR_A = 0x68;   // AD0=GND
 const uint8_t ADDR_B = 0x69;   // AD0=VCC
 
-// ----- SENSORS -----
+// Sensor objects
 Adafruit_MPU6050 mpuA;
 Adafruit_MPU6050 mpuB;
 
-// ----- CONFIG -----
+// Configuration parameters
 float alpha = 0.98f; // gravity LPF factor
 const uint16_t HOLD_MS = 150;    // LED hold after trigger (ms)
 
 // X-axis thresholds (m/s^2)
-const float THRESH_X_ON_MS2  = 5.5f;   // was 7.5
-const float THRESH_X_OFF_MS2 = 1.2f;   // keep
+const float THRESH_X_ON_MS2  = 5.5f;   // punch detection
+const float THRESH_X_OFF_MS2 = 1.2f;   // release hysteresis
 
 // Punch displacement gates (meters, forward = +X)
-const float POS_ON_M  = 0.015f;        // was 0.020
-const float POS_OFF_M = 0.012f;        // keep
+const float POS_ON_M  = 0.015f;     // 1.5 cm to trigger  
+const float POS_OFF_M = 0.012f;     // 1.2 cm to release (hysteresis)
 
 // Absolute forward displacement (from seed) required for a punch
 const float ABS_POS_ON_M  = 0.08f;  // 8 cm to trigger
 const float ABS_POS_OFF_M = 0.05f;  // 5 cm to release (hysteresis)
 
-// NEW pull-back displacement gates (meters, backward = −X)
+// Pull-back displacement gates (meters, backward = -X)
 const float PB_POS_ON_M  = 0.020f;   // 2.0 cm to trigger guard
 const float PB_POS_OFF_M = 0.012f;   // 1.2 cm to release (hysteresis)
 
-// Add near the top with other config:
-const uint16_t GUARD_REARM_MS = 120;   // refractory after guard releases
+// Guard refractory time after release
+const uint16_t GUARD_REARM_MS = 120; 
+
+// Guard rearm timer
 unsigned long guard_rearm_until = 0;
 
-// Integration drift control (time constants, seconds)
-const float TAU_VEL_S = 0.25f;  // velocity leak [punch]
-const float TAU_POS_S = 2.0f;   // position leak [punch]
+// leak time constants
+const float TAU_VEL_S = 0.25f;  
+const float TAU_POS_S = 2.0f;  
 
-// >>> pull-back: longer memory so slow moves accumulate
+// pull-back leak rates
 const float TAU_VEL_PB_S = 1.0f; // pull-back velocity leak
 const float TAU_POS_PB_S = 4.0f; // pull-back position leak
 
-// dt clamp for robustness (~20 Hz)
+// max dt for integration steps
 const float DT_MAX_S  = 0.05f;
 
-// Optional hard clamps to keep integrator bounded
+// Velocity/position clamps
 const float VEL_CLAMP = 10.0f;  // m/s
 const float POS_CLAMP = 0.30f;  // m   (30 cm envelope)
 
-// --- Start button ---
+// Start Button
 const uint8_t BTN_START   = 13;     // tie to GND when pressed
 const uint16_t DEBOUNCE_MS = 30;
-
-bool btnPrev = true;                // INPUT_PULLUP: true = released
+bool btnPrev = true;            
 unsigned long lastBtnChange = 0;
 
+// rising-edge detector with debounce
 inline bool startPressed() {
   bool s = (digitalRead(BTN_START) == LOW);
   if (s != btnPrev && (millis() - lastBtnChange) > DEBOUNCE_MS) {
     btnPrev = s; lastBtnChange = millis();
-    if (s) return true;             // rising edge (press)
+    if (s) return true;             
   }
   return false;
 }
 
-// const uint8_t LED_PULL_BACK = 5;
 const uint8_t LED_PASS = 6;     // temp led for pass fail, and MPU A init
 const uint8_t LED_FAIL = 7;     // temp led for pass fail, and MPU B init
 
 // BCD bus (share to both 7447s)
-const uint8_t BCD_PINS[4] = {2, 3, 4, 5}; // A,B,C,D (choose any free pins)
+const uint8_t BCD_PINS[4] = {2, 3, 4, 5}; // A,B,C,D 
 
 // Per-digit enables to 7447 BI/ pins (active LOW to blank)
 const uint8_t EN_A = 12;  // -> BI/_A
@@ -129,60 +122,47 @@ const uint8_t HEALTH_FAIL_LIMIT = 3;
 const uint16_t HEALTH_PERIOD_MS = 500;
 const uint16_t FAIL_BLINK_MS = 100;
 
-// --- Guard-pose option (Y/Z agreement). Leave OFF to use reverse-accel-only ---
-const bool USE_GUARD_POSE = false;   // <- set true to re-enable Y/Z checks
+// Guard decay rate tweak
+const float GUARD_PB_BLEED = 0.80f;   // 80% velocity retained when guard active
 
-// Guard-pose gating (angle + hysteresis + smoothing) — very loose cone
-const float GUARD_COS_ON  = 0.35f;
-const float GUARD_COS_OFF = 0.25f;
-const float GUARD_COS_ALPHA = 0.80f;  // LPF on cos(angle)
-
-// Optional: bleed a tad slower so PB state sticks long enough to latch
-// was 0.75
-const float GUARD_PB_BLEED = 0.80f;   // 0.75→0.80: slower decay while guard_on
-
-// Add to globals:
-const uint16_t GUARD_MAX_HOLD_MS = 700; // tune 600–900 ms
+// Guard max hold time
+const uint16_t GUARD_MAX_HOLD_MS = 700; // 700 ms max hold
 static unsigned long tGuardOn = 0;
 
+// Reverse/back state
 bool backA_on = false, backB_on = false;
 unsigned long tBackA = 0, tBackB = 0;
 
-// Reverse/back accel thresholds — slightly easier to hit
-// was -3.5 / -1.5
-const float BACK_ON_MS2  = -2.8f;    // classify "back" sooner
-const float BACK_OFF_MS2 = -1.2f;    // release a touch sooner
+// Back thresholds
+const float BACK_ON_MS2  = -2.8f;    // require stronger backward accel to trigger
+const float BACK_OFF_MS2 = -1.2f;    // relax to release
 
-// Overlap/hold for A & B agreement
-// was 120 ms hold, 80 ms overlap
-const uint16_t BACK_HOLD_MS    = 90;  // less time "both back" needed to latch
-const uint16_t BACK_OVERLAP_MS = 100; // a bit more A/B skew allowed
+// Back hold times
+const uint16_t BACK_HOLD_MS    = 90;   // min hold time
+const uint16_t BACK_OVERLAP_MS = 100;  // min gap between back and punch
 
-// --- classify back using accel + displacement, but veto any forward motion
-const float BACK_ACCEL_VETO = 0.25f;   // small positive accel = not back
-const float BACK_MOVE_EPS   = 0.01f;   // tiny backward speed threshold
+// Back veto thresholds
+const float BACK_ACCEL_VETO = 0.25f;   // back accel above this vetoes punch
+const float BACK_MOVE_EPS   = 0.01f;   // back velocity above this vetoes punch
 
-// Reverse -> temporarily block punch arming (tighten thresholds a bit)
-const uint16_t REVERSE_REARM_MS    = 120;   // 100–150 ms is fine
-const float    REVERSE_ACCEL_TRIP  = -2.0f; // require clearer backward accel
-const float    PB_VEL_TRIP         = -0.08f;// require a bit more back drift
+// Reverse rearm time
+const uint16_t REVERSE_REARM_MS    = 120;   // min time after reverse before next punch
+const float    REVERSE_ACCEL_TRIP  = -2.0f;  // require strong back accel to trip
+const float    PB_VEL_TRIP         = -0.08f; // require a bit more back drift
 
 // Adaptive growth thresholds (abs and rate-based)
 const float    POS_GROWTH_MIN_ABS  = 0.0008f; // ~0.8 mm absolute per loop
 const float    POS_GROWTH_MIN_RATE = 0.02f;   // ~2 cm/s equivalent
 
-// Extra safety: require px to be growing a hair while arming
+// minimum growth to consider dynamic
 const float    POS_GROWTH_MIN     = 0.003f; // ~3 mm since last loop
 
-// --- Tiny arming window so we measure real growth over ~80–140 ms ---
-const uint16_t ARM_WIN_MS      = 150;     // was 120
-const float    ARM_GROWTH_NEED = 0.0035f; // was 0.006 (need ~3.5 mm)
+// growth adaptation parameters
+const uint16_t ARM_WIN_MS      = 150;     // 150 ms window to consider for growth
+const float    ARM_GROWTH_NEED = 0.0035f; // ~3.5 mm min growth to arm
 
-// Guard state
-bool   guard_on  = false;
-float  cos_lpf   = 1.0f;              // filtered cos(angle) between gravities
 
-// physical forward previously read as −X; flip X so forward ⇒ +X
+// Orientation matrices
 const int8_t ORIENT_A[9] = {
   -1, 0, 0,
    0,+1, 0,
@@ -194,27 +174,19 @@ const int8_t ORIENT_B[9] = {
    0, 0,+1
 };
 
-// widen quiet window so a slightly-tilted board isn't considered "dynamic"
+// Gravity constants
 const float G_NOMINAL = 9.80665f;
 const float G_LOW  = 8.8f;
 const float G_HIGH = 11.5f;
 
-// stillness auto-reseed (plumbing kept in case you want it later)
-bool wantReseedA = false, wantReseedB = false;
-
-int score = 0;
-
-const uint8_t TEMP_LED1 = 0;   // shows "01" (A)
-const uint8_t TEMP_LED2 = 1;  // shows "10" (B)
+// used for instructions until sound is implemented
+const uint8_t TEMP_LED1 = 0;  
+const uint8_t TEMP_LED2 = 1;  
 
 inline void setTempLEDs(bool left, bool right) {
   digitalWrite(TEMP_LED1, left ? HIGH : LOW);
   digitalWrite(TEMP_LED2, right ? HIGH : LOW);
 }
-
-// Demo sequence state
-bool demo_active = false;
-unsigned long demo_t0 = 0;
 
 inline void setTargetLEDs(DemoTarget t) {
   switch (t) {
@@ -224,10 +196,27 @@ inline void setTargetLEDs(DemoTarget t) {
   }
 }
 
+// Demo parameters
 DemoPhase demo_phase = DEMO_IDLE;
 DemoTarget target = TGT_A;
 const unsigned long DEMO_ON_MS    = 10000UL; // max window for an ON phase
 const unsigned long DEMO_BREAK_MS = 2000UL; // break time now 2 seconds
+
+// Reseting state
+bool wantReseedA = false, wantReseedB = false;
+
+// Score
+int score = 0;
+
+// Game state
+bool game_started = false;
+
+// Guard state
+bool   guard_on  = false;
+
+// Demo sequence state
+bool demo_active = false;
+unsigned long demo_t0 = 0;
 
 // rounds / fails
 uint16_t rounds = 0;
@@ -243,14 +232,13 @@ volatile uint8_t disp_left  = 0;
 volatile uint8_t disp_right = 0;
 
 unsigned long phase_t0 = 0;
-bool phase_met = false;         // was the required action seen during ON?
 
 // edge detectors (so we count "at least once")
 bool prevPunchA = false;
 bool prevPunchB = false;
 bool prevGuard  = false;
 
-// --- PASS/FAIL 1s pulse state ---
+// pass/fail pulse state
 bool pass_pulse = false, fail_pulse = false;
 unsigned long pass_until = 0, fail_until = 0;
 
@@ -266,10 +254,11 @@ inline void triggerFail() {
   digitalWrite(LED_FAIL, HIGH);
 }
 
+// quieten kinematics (after a punch)
 static inline void quieten(GravState &st) {
   st.punch_on = false;
   st.arming   = false;
-  st.vx      *= 0.25f;   // strong bleed
+  st.vx      *= 0.25f;  
   st.px      *= 0.50f;
   st.vx_pb   *= 0.50f;
   st.pbx     *= 0.50f;
@@ -334,6 +323,7 @@ static inline void mapAccel(const sensors_event_t &a, const int8_t M[9],
   az = M[6]*rx + M[7]*ry + M[8]*rz;
 }
 
+// I2C read 8-bit register
 bool i2cReadReg8(uint8_t addr, uint8_t reg, uint8_t &val) {
   Wire.beginTransmission(addr);
   Wire.write(reg);
@@ -349,6 +339,7 @@ bool i2cReadReg8(uint8_t addr, uint8_t reg, uint8_t &val) {
   return (n == 1);
 }
 
+// check health of one MPU by reading WHO_AM_I register
 void checkHealth(uint8_t addr, HealthState &hs, const char *tag) {
   uint8_t v = 0x00;
   bool ok = i2cReadReg8(addr, WHO_AM_I_REG, v) && (v == WHO_AM_I_VALUE);
@@ -365,6 +356,7 @@ void checkHealth(uint8_t addr, HealthState &hs, const char *tag) {
   }
 }
 
+// MPU startup
 bool beginMPU(Adafruit_MPU6050 &mpu, uint8_t addr, const char *tag) {
   if (!mpu.begin(addr)) {
     // Serial.print(tag); Serial.println(" begin() failed");
@@ -376,14 +368,7 @@ bool beginMPU(Adafruit_MPU6050 &mpu, uint8_t addr, const char *tag) {
   return true;
 }
 
-// ---- LED helpers ----
-// void setFwdLED(bool isA, bool on) {
-//   if (isA) digitalWrite(LED_A_FWD, on ? HIGH : LOW);
-//   else     digitalWrite(LED_B_FWD, on ? HIGH : LOW);
-// }
-// void clearFwdLEDs(bool isA) { if (isA) digitalWrite(LED_A_FWD, LOW); else digitalWrite(LED_B_FWD, LOW); }
-
-// --- averaged gravity seed to avoid seeding during micro-motion ---
+// seed gravity and reset kinematics
 void seedGravity(Adafruit_MPU6050 &mpu, GravState &st, const char *tag, const int8_t ORIENT[9]) {
   sensors_event_t a, g, temp;
   const int N = 50;
@@ -418,11 +403,13 @@ void seedGravity(Adafruit_MPU6050 &mpu, GravState &st, const char *tag, const in
   // Serial.print(tag); Serial.print(" gravity/kinematics seeded (avg n="); Serial.print(n); Serial.println(")");
 }
 
+// set the displayed digits (0–9)
 inline void displaySet(uint8_t left, uint8_t right) {
   disp_left  = left  % 10;
   disp_right = right % 10;
 }
 
+// reset game state and do 3-2-1-0 countdown
 void resetGameAndSeed() {
   
   score = 0;
@@ -441,9 +428,6 @@ void resetGameAndSeed() {
     }
   }
 
-  // Clear LEDs & guard/reverse-punch state
-  // clearFwdLEDs(true); clearFwdLEDs(false);
-  // digitalWrite(LED_PULL_BACK, LOW);
   guard_on = false;
   backA_on = backB_on = false;
   tBackA = tBackB = 0;
@@ -526,7 +510,7 @@ void guard(GravState &sa, GravState &sb,
     return;
   }
 
-  // ---- Latched: bleed PB gently and check release conditions ----
+  // If latched, apply pull-back bleed
   sa.pbx   *= GUARD_PB_BLEED;
   sb.pbx   *= GUARD_PB_BLEED;
   sa.vx_pb *= GUARD_PB_BLEED;
@@ -546,8 +530,7 @@ void guard(GravState &sa, GravState &sb,
 }
 
 
-
-// ------- 1D kinematics helpers (decay factors per dt) -------
+// decay factor for exponential leak
 static inline float decayFactor(float dt_s, float tau_s) {
   if (tau_s <= 0.0f) return 0.0f;
   if (dt_s < 0.0f) dt_s = 0.0f;
@@ -612,7 +595,7 @@ void punch(Adafruit_MPU6050 &mpu, GravState &st, HealthState &hs, bool isA, cons
   float lx = ax - st.gx;
   st.lx_last = lx;
 
-  // ----- Optional sanity LEDs (forward/back accel sign) -----
+  // Sanity LED indicators
   #if defined(SANITY_ACCEL_DEBUG) && SANITY_ACCEL_DEBUG
     digitalWrite(LED_PASS, (lx >  3.0f) ? HIGH : LOW);  // forward accel
     digitalWrite(LED_FAIL, (lx < -3.0f) ? HIGH : LOW);  // backward accel
@@ -631,13 +614,13 @@ void punch(Adafruit_MPU6050 &mpu, GravState &st, HealthState &hs, bool isA, cons
       ((long)(now - guard_rearm_until) < 0) ||
       ((long)(now - st.rev_rearm_until) < 0);
 
-  // ------- decay factors -------
+  // Decay factors
   float kv    = decayFactor(dt, TAU_VEL_S);
   float kp    = decayFactor(dt, TAU_POS_S);
   float kv_pb = decayFactor(dt, TAU_VEL_PB_S);
   float kp_pb = decayFactor(dt, TAU_POS_PB_S);
 
-  // ====== FORWARD (punch) INTEGRATION ======
+  // FORWARD INTEGRATION
   if (lx > 0.0f && !inhibitPunch) {
     st.vx = st.vx * kv + lx * dt;      // integrate forward accel
   } else {
@@ -653,7 +636,7 @@ void punch(Adafruit_MPU6050 &mpu, GravState &st, HealthState &hs, bool isA, cons
   st.px = st.px * kp + st.vx * dt;     // integrate position
   st.px = fmaxf(fminf(st.px,  POS_CLAMP), -POS_CLAMP);
 
-  // ====== PULL-BACK INTEGRATION (for guard/back logic) ======
+  // PULL-BACK INTEGRATION
   const float LX_NOISE = 0.05f;
   float lx_for_pb = (fabsf(lx) < LX_NOISE) ? 0.0f : lx;
   st.vx_pb = st.vx_pb * kv_pb + lx_for_pb * dt;
@@ -665,7 +648,7 @@ void punch(Adafruit_MPU6050 &mpu, GravState &st, HealthState &hs, bool isA, cons
   }
   st.pbx = fmaxf(fminf(st.pbx,  POS_CLAMP), -POS_CLAMP);
 
-  // ====== Arming window & trigger logic ======
+  // Adaptive arming logic
   if (!inhibitPunch && lx > 0.0f) {
     if (!st.arming) {
       st.arming    = true;
@@ -676,6 +659,7 @@ void punch(Adafruit_MPU6050 &mpu, GravState &st, HealthState &hs, bool isA, cons
     st.arming = false;
   }
 
+  // Check growth during arming
   bool growthOK = false;
   if (st.arming) {
     float grown = st.px - st.px_at_arm;
@@ -698,6 +682,7 @@ void punch(Adafruit_MPU6050 &mpu, GravState &st, HealthState &hs, bool isA, cons
   bool absPosOn  = (st.px >= ABS_POS_ON_M);  // e.g., 0.08 m
   bool absPosOff = (st.px <= ABS_POS_OFF_M); // e.g., 0.05 m
 
+  // Inhibit all if guard/reverse active
   if (inhibitPunch) {
     forwardAccel = forwardVel = false;
     posOK = false;
