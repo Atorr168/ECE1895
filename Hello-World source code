@@ -10,6 +10,19 @@
 #include <Adafruit_Sensor.h>
 #include <Wire.h>
 #include <math.h>
+#include "Arduino.h"
+#include "DFRobotDFPlayerMini.h"
+
+#if (defined(ARDUINO_AVR_UNO) || defined(ESP8266))   // Using a soft serial port
+#include <SoftwareSerial.h>
+SoftwareSerial softSerial(/*rx =*/8, /*tx =*/9);
+#define FPSerial softSerial
+#else
+#define FPSerial Serial1
+#endif
+
+DFRobotDFPlayerMini myDFPlayer;
+void printDetail(uint8_t type, int value);
 
 
 // ==== 1) Types FIRST (before any function that uses them) ====
@@ -218,9 +231,16 @@ unsigned long demo_t0 = 0;
 
 inline void setTargetLEDs(DemoTarget t) {
   switch (t) {
-    case TGT_A:  setTempLEDs(true,  false); break; // "01"
-    case TGT_B:  setTempLEDs(false, true ); break; // "10"
-    case TGT_PB: setTempLEDs(true,  true ); break; // "11"
+    case TGT_A:  setTempLEDs(true,  false); 
+      //Play speaker sound
+      myDFPlayer.play(1); // Jab
+      break; // "01"
+    case TGT_B:  setTempLEDs(false, true ); 
+      myDFPlayer.play(2); //Cross
+      break; // "10"
+    case TGT_PB: setTempLEDs(true,  true ); 
+      myDFPlayer.play(3); //BLOCK
+      break; // "11"
   }
 }
 
@@ -721,11 +741,108 @@ void punch(Adafruit_MPU6050 &mpu, GravState &st, HealthState &hs, bool isA, cons
   st.px_last = st.px;
 }
 
+void printDetail(uint8_t type, int value){
+  switch (type) {
+    case TimeOut:
+      Serial.println(F("Time Out!"));
+      break;
+    case WrongStack:
+      Serial.println(F("Stack Wrong!"));
+      break;
+    case DFPlayerCardInserted:
+      Serial.println(F("Card Inserted!"));
+      break;
+    case DFPlayerCardRemoved:
+      Serial.println(F("Card Removed!"));
+      break;
+    case DFPlayerCardOnline:
+      Serial.println(F("Card Online!"));
+      break;
+    case DFPlayerUSBInserted:
+      Serial.println("USB Inserted!");
+      break;
+    case DFPlayerUSBRemoved:
+      Serial.println("USB Removed!");
+      break;
+    case DFPlayerPlayFinished:
+      Serial.print(F("Number:"));
+      Serial.print(value);
+      Serial.println(F(" Play Finished!"));
+      break;
+    case DFPlayerError:
+      Serial.print(F("DFPlayerError:"));
+      switch (value) {
+        case Busy:
+          Serial.println(F("Card not found"));
+          break;
+        case Sleeping:
+          Serial.println(F("Sleeping"));
+          break;
+        case SerialWrongStack:
+          Serial.println(F("Get Wrong Stack"));
+          break;
+        case CheckSumNotMatch:
+          Serial.println(F("Check Sum Not Match"));
+          break;
+        case FileIndexOut:
+          Serial.println(F("File Index Out of Bound"));
+          break;
+        case FileMismatch:
+          Serial.println(F("Cannot Find File"));
+          break;
+        case Advertise:
+          Serial.println(F("In Advertise"));
+          break;
+        default:
+          break;
+      }
+      break;
+    default:
+      break;
+  }
+  
+}
+
+
 
 
 
 void setup() {
-  // Serial.begin(115200);
+  #if (defined ESP32)
+  FPSerial.begin(9600, SERIAL_8N1, /*rx =*/D3, /*tx =*/D2);
+  #else
+  FPSerial.begin(9600);
+  #endif
+  Serial.begin(115200);
+
+  Serial.println();
+  Serial.println(F("DFRobot DFPlayer Mini Demo"));
+  Serial.println(F("Initializing DFPlayer ... (May take 3~5 seconds)"));
+  
+  if (!myDFPlayer.begin(FPSerial, /*isACK = */true, /*doReset = */true)) {  //Use serial to communicate with mp3.
+    Serial.println(F("Unable to begin:"));
+    Serial.println(F("1.Please recheck the connection!"));
+    Serial.println(F("2.Please insert the SD card!"));
+    while(true);
+  }
+  Serial.println(F("DFPlayer Mini online."));
+  
+  myDFPlayer.setTimeOut(500); //Set serial communictaion time out 500ms
+  
+  //----Set volume----
+  myDFPlayer.volume(20);  //Set volume value (0~30).
+  
+  //----Set different EQ----
+  myDFPlayer.EQ(DFPLAYER_EQ_NORMAL);
+  myDFPlayer.outputDevice(DFPLAYER_DEVICE_SD); // Default storage
+  //Get info on player
+  Serial.println(myDFPlayer.readState()); //read mp3 state
+  Serial.println(myDFPlayer.readVolume()); //read current volume
+  Serial.println(myDFPlayer.readEQ()); //read EQ setting
+  Serial.println(myDFPlayer.readFileCounts()); //read all file counts in SD card
+  Serial.println(myDFPlayer.readCurrentFileNumber()); //read current play file number
+  Serial.println(myDFPlayer.readFileCountsInFolder(3));
+
   Wire.begin();
   Wire.setClock(400000);
   Wire.setWireTimeout(25000, true);
@@ -920,6 +1037,7 @@ void loop() {
         }
         if (wrong) {
           triggerFail();
+          myDFPlayer.play(6);
           fails++;
           rounds++;
           setTempLEDs(false, false);
@@ -952,12 +1070,16 @@ void loop() {
         break;
 
       case DEMO_DONE: {
+        myDFPlayer.play(7);
+        delay(9000);
         if (game_over) {
           // continuous blink on both LEDs 9 & 10
           bool on = ((nowMs / GAMEOVER_BLINK_MS) % 2);
           setTempLEDs(on, on);
+          myDFPlayer.play(8);
         } else {
           // finished the 103 rounds without hitting fail limit: stay off
+          myDFPlayer.play(9);
           setTempLEDs(false, false);
         }
       } break;
