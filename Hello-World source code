@@ -513,6 +513,9 @@ void resetGameAndSeed() {
     }
   }
 
+  playClip(7);
+  delay(3000);
+
   // Clear LEDs & guard/reverse-punch state
   // clearFwdLEDs(true); clearFwdLEDs(false);
   // digitalWrite(LED_PULL_BACK, LOW);
