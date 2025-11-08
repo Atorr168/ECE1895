@@ -10,6 +10,21 @@
 #include <Adafruit_Sensor.h>
 #include <Wire.h>
 #include <math.h>
+#include "Arduino.h"
+#include "DFRobotDFPlayerMini.h"
+
+#if defined(ARDUINO_AVR_UNO) || defined(ARDUINO_AVR_NANO) || defined(ARDUINO_AVR_PRO)
+  #include <AltSoftSerial.h>
+  AltSoftSerial FPSerial;              // UNO/Nano: RX=8, TX=9 (fixed)
+#elif defined(ESP8266)
+  #include <SoftwareSerial.h>
+  SoftwareSerial FPSerial(D3, D2);     // RX=D3, TX=D2 (example)
+#else
+  #define FPSerial Serial1             // e.g., Mega/ESP32 use hardware UART
+#endif
+
+DFRobotDFPlayerMini myDFPlayer;
+// void printDetail(uint8_t type, int value);
 
 
 // ==== 1) Types FIRST (before any function that uses them) ====
@@ -61,12 +76,12 @@ float alpha = 0.98f; // gravity LPF factor
 const uint16_t HOLD_MS = 150;    // LED hold after trigger (ms)
 
 // X-axis thresholds (m/s^2)
-const float THRESH_X_ON_MS2  = 5.5f;   // was 7.5
-const float THRESH_X_OFF_MS2 = 1.2f;   // keep
+const float THRESH_X_ON_MS2  = 5.5f;   
+const float THRESH_X_OFF_MS2 = 1.2f;  
 
 // Punch displacement gates (meters, forward = +X)
-const float POS_ON_M  = 0.015f;        // was 0.020
-const float POS_OFF_M = 0.012f;        // keep
+const float POS_ON_M  = 0.015f;       
+const float POS_OFF_M = 0.012f;       
 
 // Absolute forward displacement (from seed) required for a punch
 const float ABS_POS_ON_M  = 0.08f;  // 8 cm to trigger
@@ -112,8 +127,8 @@ inline bool startPressed() {
 }
 
 // const uint8_t LED_PULL_BACK = 5;
-const uint8_t LED_PASS = 6;     // temp led for pass fail, and MPU A init
-const uint8_t LED_FAIL = 7;     // temp led for pass fail, and MPU B init
+const uint8_t LED_PASS = 6;     // led for pass fail, and MPU A init
+const uint8_t LED_FAIL = 7;     // led for pass fail, and MPU B init
 
 // BCD bus (share to both 7447s)
 const uint8_t BCD_PINS[4] = {2, 3, 4, 5}; // A,B,C,D (choose any free pins)
@@ -129,16 +144,14 @@ const uint8_t HEALTH_FAIL_LIMIT = 3;
 const uint16_t HEALTH_PERIOD_MS = 500;
 const uint16_t FAIL_BLINK_MS = 100;
 
-// --- Guard-pose option (Y/Z agreement). Leave OFF to use reverse-accel-only ---
-const bool USE_GUARD_POSE = false;   // <- set true to re-enable Y/Z checks
+// Guard-pose option (Y/Z agreement). Leave OFF to use reverse-accel-only ---
+const bool USE_GUARD_POSE = false;   // set true to re-enable Y/Z checks
 
 // Guard-pose gating (angle + hysteresis + smoothing) — very loose cone
 const float GUARD_COS_ON  = 0.35f;
 const float GUARD_COS_OFF = 0.25f;
 const float GUARD_COS_ALPHA = 0.80f;  // LPF on cos(angle)
 
-// Optional: bleed a tad slower so PB state sticks long enough to latch
-// was 0.75
 const float GUARD_PB_BLEED = 0.80f;   // 0.75→0.80: slower decay while guard_on
 
 // Add to globals:
@@ -158,7 +171,7 @@ const float BACK_OFF_MS2 = -1.2f;    // release a touch sooner
 const uint16_t BACK_HOLD_MS    = 90;  // less time "both back" needed to latch
 const uint16_t BACK_OVERLAP_MS = 100; // a bit more A/B skew allowed
 
-// --- classify back using accel + displacement, but veto any forward motion
+// classify back using accel + displacement, but veto any forward motion
 const float BACK_ACCEL_VETO = 0.25f;   // small positive accel = not back
 const float BACK_MOVE_EPS   = 0.01f;   // tiny backward speed threshold
 
@@ -199,34 +212,84 @@ const float G_NOMINAL = 9.80665f;
 const float G_LOW  = 8.8f;
 const float G_HIGH = 11.5f;
 
-// stillness auto-reseed (plumbing kept in case you want it later)
+// stillness auto-reseed 
 bool wantReseedA = false, wantReseedB = false;
+
+bool au_donePlayed=false, au_gameoverPlayed=false, au_finishedPlayed=false;
 
 int score = 0;
 
-const uint8_t TEMP_LED1 = 0;   // shows "01" (A)
-const uint8_t TEMP_LED2 = 1;  // shows "10" (B)
+// const uint8_t TEMP_LED1 = 0;   // shows "01" (A)
+// const uint8_t TEMP_LED2 = 1;  // shows "10" (B)
 
-inline void setTempLEDs(bool left, bool right) {
-  digitalWrite(TEMP_LED1, left ? HIGH : LOW);
-  digitalWrite(TEMP_LED2, right ? HIGH : LOW);
-}
+// inline void setTempLEDs(bool left, bool right) {
+//   digitalWrite(TEMP_LED1, left ? HIGH : LOW);
+//   digitalWrite(TEMP_LED2, right ? HIGH : LOW);
+// }
 
 // Demo sequence state
 bool demo_active = false;
 unsigned long demo_t0 = 0;
 
+// --- Round timing that speeds up each round ---
+const unsigned long ON_MS_START  = 20000UL; // ~20 s initial
+const unsigned long ON_MS_MIN    = 3000UL;  // 3 s floor
+const uint16_t      TARGET_ROUND_TO_MIN = 50;
+const float         ON_SPEEDUP = powf(
+  (float)ON_MS_MIN / (float)ON_MS_START,
+  1.0f / (float)TARGET_ROUND_TO_MIN
+); // ≈ 0.9549926 per round
+const float         ON_JITTER   = 0.10f;    // ±10% randomness
+
+
+unsigned long demo_on_ms_base = ON_MS_START; // base (monotonic down to ON_MS_MIN)
+unsigned long demo_on_ms_eff  = ON_MS_START; // effective for the current ON phase (with jitter)
+
+static inline unsigned long jittered(unsigned long base) {
+  long j = (long)(base * ON_JITTER);
+  long v = (long)base + (long)random(-j, j + 1);
+  if (v < (long)ON_MS_MIN) v = (long)ON_MS_MIN;
+  return (unsigned long)v;
+}
+
+void playClip(uint16_t id, bool force=false) {
+  static uint16_t lastId = 0;
+  static unsigned long lastMs = 0;
+  unsigned long now = millis();
+
+  // reject duplicates within 250 ms
+  if (!force && id == lastId && (now - lastMs) < 250) return;
+
+  myDFPlayer.stop();          // prevent overlap / garble
+  delay(10);                  // small settle time
+  myDFPlayer.playMp3Folder(id);
+
+  lastId = id;
+  lastMs = now;
+}
+
+
 inline void setTargetLEDs(DemoTarget t) {
   switch (t) {
-    case TGT_A:  setTempLEDs(true,  false); break; // "01"
-    case TGT_B:  setTempLEDs(false, true ); break; // "10"
-    case TGT_PB: setTempLEDs(true,  true ); break; // "11"
+    case TGT_A:  
+      // setTempLEDs(true,  false); 
+      //Play speaker sound
+      playClip(1); // Jab
+      break; // "01"
+    case TGT_B:  
+      // setTempLEDs(false, true ); 
+      playClip(2); //Cross
+      break; // "10"
+    case TGT_PB: 
+      // setTempLEDs(true,  true ); 
+      playClip(3); //BLOCK
+      break; // "11"
   }
 }
 
 DemoPhase demo_phase = DEMO_IDLE;
 DemoTarget target = TGT_A;
-const unsigned long DEMO_ON_MS    = 10000UL; // max window for an ON phase
+// const unsigned long DEMO_ON_MS    = 10000UL; // max window for an ON phase
 const unsigned long DEMO_BREAK_MS = 2000UL; // break time now 2 seconds
 
 // rounds / fails
@@ -253,6 +316,7 @@ bool prevGuard  = false;
 // --- PASS/FAIL 1s pulse state ---
 bool pass_pulse = false, fail_pulse = false;
 unsigned long pass_until = 0, fail_until = 0;
+
 
 // fire-and-forget helpers
 inline void triggerPass() {
@@ -309,6 +373,10 @@ static inline void renormG(GravState &st) {
     float s = G_NOMINAL / gm;
     st.gx *= s; st.gy *= s; st.gz *= s;
   }
+}
+
+static inline void audioResetFlags() {
+  au_donePlayed = au_gameoverPlayed = au_finishedPlayed = false;
 }
 
 void writeBCD(uint8_t val) {
@@ -376,6 +444,7 @@ bool beginMPU(Adafruit_MPU6050 &mpu, uint8_t addr, const char *tag) {
   return true;
 }
 
+
 // ---- LED helpers ----
 // void setFwdLED(bool isA, bool on) {
 //   if (isA) digitalWrite(LED_A_FWD, on ? HIGH : LOW);
@@ -430,6 +499,9 @@ void resetGameAndSeed() {
   fails  = 0;
   game_over = false;
 
+  demo_on_ms_base = ON_MS_START;      // reset base to ~20s
+  demo_on_ms_eff  = jittered(demo_on_ms_base); // pick the first ON window with jitter
+
   // 3-2-1-0 countdown, keep multiplexing alive while we wait ~1s per digit
   for (int d = 3; d >= 0; --d) {
     unsigned long end = millis() + 1000;
@@ -456,6 +528,7 @@ void resetGameAndSeed() {
 
   // Start the guided demo phases
   // Start randomized rounds
+  audioResetFlags();        
   target = (DemoTarget)random(0, 3);   // A, B, or PB
   demo_phase = DEMO_ON;
   phase_t0   = millis();
@@ -722,10 +795,86 @@ void punch(Adafruit_MPU6050 &mpu, GravState &st, HealthState &hs, bool isA, cons
 }
 
 
+// void printDetail(uint8_t type, int value){
+//   switch (type) {
+//     case TimeOut:
+//       Serial.println(F("Time Out!"));
+//       break;
+//     case WrongStack:
+//       Serial.println(F("Stack Wrong!"));
+//       break;
+//     case DFPlayerCardInserted:
+//       Serial.println(F("Card Inserted!"));
+//       break;
+//     case DFPlayerCardRemoved:
+//       Serial.println(F("Card Removed!"));
+//       break;
+//     case DFPlayerCardOnline:
+//       Serial.println(F("Card Online!"));
+//       break;
+//     case DFPlayerUSBInserted:
+//       Serial.println("USB Inserted!");
+//       break;
+//     case DFPlayerUSBRemoved:
+//       Serial.println("USB Removed!");
+//       break;
+//     case DFPlayerPlayFinished:
+//       Serial.print(F("Number:"));
+//       Serial.print(value);
+//       Serial.println(F(" Play Finished!"));
+//       break;
+//     case DFPlayerError:
+//       Serial.print(F("DFPlayerError:"));
+//       switch (value) {
+//         case Busy:
+//           Serial.println(F("Card not found"));
+//           break;
+//         case Sleeping:
+//           Serial.println(F("Sleeping"));
+//           break;
+//         case SerialWrongStack:
+//           Serial.println(F("Get Wrong Stack"));
+//           break;
+//         case CheckSumNotMatch:
+//           Serial.println(F("Check Sum Not Match"));
+//           break;
+//         case FileIndexOut:
+//           Serial.println(F("File Index Out of Bound"));
+//           break;
+//         case FileMismatch:
+//           Serial.println(F("Cannot Find File"));
+//           break;
+//         case Advertise:
+//           Serial.println(F("In Advertise"));
+//           break;
+//         default:
+//           break;
+//       }
+//       break;
+//     default:
+//       break;
+//   }
+  
+// }
+
+
+
 
 
 void setup() {
-  // Serial.begin(115200);
+  FPSerial.begin(9600);
+
+
+
+  if (!myDFPlayer.begin(FPSerial, false, true)) { while(true){} }
+  
+  delay(200);
+  myDFPlayer.outputDevice(DFPLAYER_DEVICE_SD);
+  delay(100);
+  myDFPlayer.volume(20);
+  //----Set different EQ----
+  myDFPlayer.EQ(DFPLAYER_EQ_NORMAL);
+
   Wire.begin();
   Wire.setClock(400000);
   Wire.setWireTimeout(25000, true);
@@ -733,9 +882,9 @@ void setup() {
   pinMode(LED_PASS, OUTPUT);
   pinMode(LED_FAIL, OUTPUT);
   // pinMode(LED_PULL_BACK, OUTPUT);
-  pinMode(TEMP_LED1, OUTPUT);
-  pinMode(TEMP_LED2, OUTPUT);
-  setTempLEDs(false, false);
+  // pinMode(TEMP_LED1, OUTPUT);
+  // pinMode(TEMP_LED2, OUTPUT);
+  // setTempLEDs(false, false);
   digitalWrite(LED_PASS, LOW);
   digitalWrite(LED_FAIL, LOW);
 
@@ -753,7 +902,7 @@ void setup() {
   TCCR2B = 0;
   TCCR2A |= (1 << WGM21);     // CTC mode
   TCCR2B |= (1 << CS22);      // prescaler 64
-  OCR2A = 249;                // 16MHz / (64*(249+1)) = 1000 Hz
+  OCR2A = 499;                 // 16MHz / (64*(499+1)) = 500 Hz
   TIMSK2 |= (1 << OCIE2A);    // enable compare match A interrupt
   sei();                 // enable interrupts
 
@@ -868,12 +1017,13 @@ void loop() {
     switch (demo_phase) {
       case DEMO_ON: {
         // compute elapsed for this ON window
-        if (elapsed > DEMO_ON_MS) {
+        if (elapsed > demo_on_ms_eff) {
           // timeout = fail, count round, go to BREAK/DONE
           triggerFail();
+          playClip(6, true);
           fails++;
           rounds++;
-          setTempLEDs(false, false);
+          // setTempLEDs(false, false);
           // NEW: kill any residual punch state before leaving ON
           quieten(sA); quieten(sB);
 
@@ -904,8 +1054,9 @@ void loop() {
         if (correct) {
           score++;
           triggerPass();
+          playClip(10);
           rounds++;
-          setTempLEDs(false, false);
+          // setTempLEDs(false, false);
           // NEW:
           quieten(sA); quieten(sB);
 
@@ -915,14 +1066,16 @@ void loop() {
           phase_t0   = nowMs;
           guard_on = false;
           guard_rearm_until = nowMs + GUARD_REARM_MS;
+          delay(200);
           break;
 
         }
         if (wrong) {
           triggerFail();
+          playClip(6, true);
           fails++;
           rounds++;
-          setTempLEDs(false, false);
+          // setTempLEDs(false, false);
           // NEW:
           quieten(sA); quieten(sB);
 
@@ -931,37 +1084,41 @@ void loop() {
           demo_phase = (hitFailLimit || hitRoundLimit) ? DEMO_DONE : DEMO_BREAK;
           game_over  = hitFailLimit;
           phase_t0   = nowMs;
+          delay(200);
           break;
         }
       } break;
 
       case DEMO_BREAK:
         if (elapsed >= DEMO_BREAK_MS) {
-          // pick a new random target and start next round
+          audioResetFlags();
           target = (DemoTarget)random(0, 3);
           setTargetLEDs(target);
           demo_phase = DEMO_ON;
           phase_t0 = nowMs;
           guard_on = false;
           guard_rearm_until = nowMs + GUARD_REARM_MS;
-          sA.vx_pb = 0; sA.pbx *= 0.5f;   // soften residual PB
+          sA.vx_pb = 0; sA.pbx *= 0.5f;
           sB.vx_pb = 0; sB.pbx *= 0.5f;
-          // reset edge trackers so we don't count stale highs
           prevPunchA = prevPunchB = prevGuard = false;
+
+          // compute planned base for *this* round so that at ~round 50 we hit the floor
+          double planned = (double)ON_MS_START * pow((double)ON_SPEEDUP, (double)rounds);
+          if (planned < (double)ON_MS_MIN) planned = (double)ON_MS_MIN;
+          demo_on_ms_base = (unsigned long)planned;
+          demo_on_ms_eff  = jittered(demo_on_ms_base);
         }
         break;
 
       case DEMO_DONE: {
+        delay(300);
+        if (!au_donePlayed) { playClip(7); au_donePlayed = true; }
         if (game_over) {
-          // continuous blink on both LEDs 9 & 10
-          bool on = ((nowMs / GAMEOVER_BLINK_MS) % 2);
-          setTempLEDs(on, on);
+          if (!au_gameoverPlayed) { playClip(8); au_gameoverPlayed = true; }
         } else {
-          // finished the 103 rounds without hitting fail limit: stay off
-          setTempLEDs(false, false);
+          if (!au_finishedPlayed) { playClip(9); au_finishedPlayed = true; }
         }
       } break;
-
       default: break;
     }
   }
