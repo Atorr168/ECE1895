@@ -44,6 +44,10 @@ struct GravState {
   bool   arming = false;
   unsigned long tArm = 0;
   float  px_at_arm = 0.0f;
+  float vy = 0, py = 0;   // Y-axis velocity / displacement (meters)
+  float ly_last = 0.0f;            // latest linear accel on Y
+  unsigned long tYAccel = 0;       // time of last "meaningful" Y accel
+  int8_t y_dir = 0;                // last accel direction: -1, 0, +1
 };
 
 
@@ -55,7 +59,7 @@ struct HealthState {
  
 // --- Demo phases ---
 enum DemoPhase : uint8_t { DEMO_IDLE = 0, DEMO_ON, DEMO_BREAK, DEMO_DONE };
-enum DemoTarget : uint8_t { TGT_A = 0, TGT_B = 1, TGT_PB = 2 };
+enum DemoTarget : uint8_t { TGT_A = 0, TGT_B = 1, TGT_PB = 2, TGT_DG = 3 };
 
 // ==== 2) Globals that use those types ====
 bool game_started = false;
@@ -195,6 +199,24 @@ const float    ARM_GROWTH_NEED = 0.0035f; // was 0.006 (need ~3.5 mm)
 bool   guard_on  = false;
 float  cos_lpf   = 1.0f;              // filtered cos(angle) between gravities
 
+// --- DODGE (same-direction Y move on both sensors) ---
+const float DODGE_POS_ON_M  = 0.050f;  // 5 cm to latch
+const float DODGE_POS_OFF_M = 0.030f;  // 3 cm to release (hysteresis)
+const float DODGE_SIGN_EPS  = 0.005f;  // ignore near-zero sign noise
+
+// DODGE housekeeping
+const uint16_t DODGE_REARM_MS    = 150;   // brief lockout after release/round end
+const uint16_t DODGE_MAX_HOLD_MS = 800;   // safety timeout for a long-held dodge
+
+// Dodge must be an *active* move on both sides (not just stale offset)
+const float    DODGE_ACC_ON_MS2       = 1.2f;   // both MPUs need |ly| >= this
+const uint16_t DODGE_ACCEL_OVERLAP_MS = 120;    // accel must be recent (per side)
+
+bool dodge_on = false;                  // current dodge latch
+bool prevDodge = false;  
+unsigned long dodge_rearm_until = 0;
+static unsigned long tDodgeOn = 0;
+
 // physical forward previously read as −X; flip X so forward ⇒ +X
 const int8_t ORIENT_A[9] = {
   -1, 0, 0,
@@ -284,6 +306,9 @@ inline void setTargetLEDs(DemoTarget t) {
       // setTempLEDs(true,  true ); 
       playClip(3); //BLOCK
       break; // "11"
+    case TGT_DG:
+      playClip(4); // Dodge
+      break;
   }
 }
 
@@ -337,6 +362,8 @@ static inline void quieten(GravState &st) {
   st.px      *= 0.50f;
   st.vx_pb   *= 0.50f;
   st.pbx     *= 0.50f;
+  st.vy      *= 0.25f; 
+  st.py      *= 0.50f;  
 }
 
 
@@ -481,6 +508,7 @@ void seedGravity(Adafruit_MPU6050 &mpu, GravState &st, const char *tag, const in
   st.arming = false;         
   st.tArm = 0;            
   st.px_at_arm = 0.0f;       
+  st.vy = 0.0f; st.py = 0.0f;   
 
   st.tLast = millis();
   st.g_init = true;
@@ -498,7 +526,7 @@ void resetGameAndSeed() {
   rounds = 0;
   fails  = 0;
   game_over = false;
-
+  
   demo_on_ms_base = ON_MS_START;      // reset base to ~20s
   demo_on_ms_eff  = jittered(demo_on_ms_base); // pick the first ON window with jitter
 
@@ -522,6 +550,10 @@ void resetGameAndSeed() {
   guard_on = false;
   backA_on = backB_on = false;
   tBackA = tBackB = 0;
+  dodge_on = false;
+  prevDodge = false;
+  dodge_rearm_until = 0;
+  tDodgeOn = 0;
 
   // Reseed gravity / kinematics for any healthy sensor
   if (hA.healthy) seedGravity(mpuA, sA, "A (restart)", ORIENT_A);
@@ -532,12 +564,12 @@ void resetGameAndSeed() {
   // Start the guided demo phases
   // Start randomized rounds
   audioResetFlags();        
-  target = (DemoTarget)random(0, 3);   // A, B, or PB
+  target = (DemoTarget)random(0, 4); 
   demo_phase = DEMO_ON;
   phase_t0   = millis();
-  prevPunchA = prevPunchB = prevGuard = false;
+  prevPunchA = prevPunchB = prevGuard = prevDodge = false;
   setTargetLEDs(target);
-  prevPunchA = prevPunchB = prevGuard = false; 
+  prevPunchA = prevPunchB = prevGuard = prevDodge = false;
 }
 
 // ACTIVE-HIGH LED: HIGH = ON, LOW = OFF
@@ -631,6 +663,75 @@ static inline float decayFactor(float dt_s, float tau_s) {
   return expf(-dt_s / tau_s);
 }
 
+static inline bool sameSign(float a, float b, float eps) {
+  if (fabsf(a) < eps || fabsf(b) < eps) return false;
+  return (a > 0 && b > 0) || (a < 0 && b < 0);
+}
+
+// Latch when both |py| >= ON and same sign; add rearm + timeout + bleed
+static inline void updateDodge(GravState &sa, GravState &sb, unsigned long now) {
+  if (sa.punch_on || sb.punch_on || guard_on) return;
+
+  static bool latched = false;
+
+  // Re-arm gate
+  if ((long)(now - dodge_rearm_until) < 0) {
+    latched = false;
+    dodge_on = false;
+    return;
+  }
+
+  // Displacement gates (both ≥ 5cm and same direction)
+  bool both_far = (fabsf(sa.py) >= DODGE_POS_ON_M) && (fabsf(sb.py) >= DODGE_POS_ON_M);
+  bool same_dir_disp = sameSign(sa.py, sb.py, DODGE_SIGN_EPS);
+
+  // Fresh Y-accel gates (both had |ly|≥thresh recently and directions match displacement)
+  bool a_recent = (now - sa.tYAccel) <= DODGE_ACCEL_OVERLAP_MS;
+  bool b_recent = (now - sb.tYAccel) <= DODGE_ACCEL_OVERLAP_MS;
+
+  int8_t sign_py_a = (sa.py > 0) ? +1 : (sa.py < 0 ? -1 : 0);
+  int8_t sign_py_b = (sb.py > 0) ? +1 : (sb.py < 0 ? -1 : 0);
+
+  bool a_dir_ok = (sign_py_a != 0) && (sa.y_dir == sign_py_a);
+  bool b_dir_ok = (sign_py_b != 0) && (sb.y_dir == sign_py_b);
+
+  bool both_recent_force = a_recent && b_recent && a_dir_ok && b_dir_ok;
+
+  if (!latched) {
+    if (both_far && same_dir_disp && both_recent_force) {
+      latched = true;
+      tDodgeOn = now;
+    }
+  } else {
+    // gentle bleed while latched so it naturally releases
+    sa.vy *= 0.6f;  sa.py *= 0.8f;
+    sb.vy *= 0.6f;  sb.py *= 0.8f;
+
+    bool timeout = (now - tDodgeOn) >= DODGE_MAX_HOLD_MS;
+    bool release = (fabsf(sa.py) <= DODGE_POS_OFF_M) ||
+                   (fabsf(sb.py) <= DODGE_POS_OFF_M) ||
+                   !sameSign(sa.py, sb.py, DODGE_SIGN_EPS) || timeout;
+
+    if (release) {
+      latched = false;
+      dodge_rearm_until = now + DODGE_REARM_MS;   // refractory window
+    }
+  }
+
+  dodge_on = latched;
+}
+
+
+static inline void zeroY(GravState &st) {
+  st.vy = 0.0f; st.py = 0.0f;
+  st.ly_last = 0.0f; st.tYAccel = 0; st.y_dir = 0;
+}
+static inline void resetDodge(unsigned long now) {
+  dodge_on = false;
+  prevDodge = false;
+  tDodgeOn = 0;
+  dodge_rearm_until = now + DODGE_REARM_MS;
+}
 
 // Uncomment to enable the sanity LED test (forward/back accel blink)
 // 0 = off, 1 = on
@@ -665,6 +766,7 @@ void punch(Adafruit_MPU6050 &mpu, GravState &st, HealthState &hs, bool isA, cons
     st.tArm = 0;
     st.px_at_arm = 0.0f;
     st.tLast = now; st.g_init = true;
+    st.vy = 0.0f; st.py = 0.0f;  
   }
 
   // dt (seconds), clamped
@@ -712,6 +814,20 @@ void punch(Adafruit_MPU6050 &mpu, GravState &st, HealthState &hs, bool isA, cons
   float kp    = decayFactor(dt, TAU_POS_S);
   float kv_pb = decayFactor(dt, TAU_VEL_PB_S);
   float kp_pb = decayFactor(dt, TAU_POS_PB_S);
+
+  // Linear acceleration on Y (m/s^2)
+  float ly = ay - st.gy;
+
+  st.ly_last = ly;
+  if (fabsf(ly) >= DODGE_ACC_ON_MS2) {
+    st.tYAccel = now;
+    st.y_dir = (ly > 0) ? +1 : -1;
+  }
+  // Integrate Y with same decay constants (you can tune separately if desired)
+  st.vy = st.vy * kv + ly * dt;
+  st.vy = fmaxf(fminf(st.vy,  VEL_CLAMP), -VEL_CLAMP);
+  st.py = st.py * kp + st.vy * dt;
+  st.py = fmaxf(fminf(st.py,  POS_CLAMP), -POS_CLAMP);
 
   // ====== FORWARD (punch) INTEGRATION ======
   if (lx > 0.0f && !inhibitPunch) {
@@ -1002,6 +1118,7 @@ void loop() {
   punch(mpuA, sA, hA, true,  ORIENT_A);
   punch(mpuB, sB, hB, false, ORIENT_B);
   guard(sA, sB, hA, hB, now);
+  updateDodge(sA, sB, now);       
 
   // --- Guided demo: check required actions and advance phases ---
   if (demo_phase != DEMO_IDLE) {   // <-- was: != DEMO_IDLE && != DEMO_DONE
@@ -1013,6 +1130,8 @@ void loop() {
     bool punchB_edge = (sB.punch_on && !prevPunchB);
     bool guard_edge  = (guard_on     && !prevGuard);
 
+    bool dodge_edge = (dodge_on && !prevDodge); 
+    prevDodge = dodge_on;
     prevPunchA = sA.punch_on;
     prevPunchB = sB.punch_on;
     prevGuard  = guard_on;
@@ -1029,6 +1148,8 @@ void loop() {
           // setTempLEDs(false, false);
           // NEW: kill any residual punch state before leaving ON
           quieten(sA); quieten(sB);
+          zeroY(sA); zeroY(sB);   // shrink Y offset quickly
+          resetDodge(nowMs);          // hard unlatch + short re-arm
 
           bool hitFailLimit  = (fails  >= MAX_FAILS);
           bool hitRoundLimit = (rounds >= MAX_ROUNDS);
@@ -1045,13 +1166,16 @@ void loop() {
         bool correct = false, wrong = false;
         if (target == TGT_A) {
           if (punchA_edge) correct = true;
-          else if (punchB_edge || guard_edge) wrong = true;
+          else if (punchB_edge || guard_edge || dodge_edge) wrong = true;
         } else if (target == TGT_B) {
           if (punchB_edge) correct = true;
-          else if (punchA_edge || guard_edge) wrong = true;
-        } else { // TGT_PB
+          else if (punchA_edge || guard_edge || dodge_edge) wrong = true;
+        } else if (target == TGT_PB) {
           if (guard_edge) correct = true;
-          else if (punchA_edge || punchB_edge) wrong = true;
+          else if (punchA_edge || punchB_edge || dodge_edge) wrong = true;
+        } else { // TGT_DG
+          if (dodge_edge) correct = true;
+          else if (punchA_edge || punchB_edge || guard_edge) wrong = true;
         }
 
         if (correct) {
@@ -1060,9 +1184,9 @@ void loop() {
           playClip(10);
           rounds++;
           // setTempLEDs(false, false);
-          // NEW:
           quieten(sA); quieten(sB);
-
+          zeroY(sA); zeroY(sB);   // shrink Y offset quickly
+          resetDodge(nowMs);          // hard unlatch + short re-arm
           bool hitRoundLimit = (rounds >= MAX_ROUNDS);
           demo_phase = hitRoundLimit ? DEMO_DONE : DEMO_BREAK;
           game_over  = false;
@@ -1079,8 +1203,9 @@ void loop() {
           fails++;
           rounds++;
           // setTempLEDs(false, false);
-          // NEW:
           quieten(sA); quieten(sB);
+          zeroY(sA); zeroY(sB);   // shrink Y offset quickly
+          resetDodge(nowMs);          // hard unlatch + short re-arm
 
           bool hitFailLimit  = (fails  >= MAX_FAILS);
           bool hitRoundLimit = (rounds >= MAX_ROUNDS);
@@ -1095,7 +1220,7 @@ void loop() {
       case DEMO_BREAK:
         if (elapsed >= DEMO_BREAK_MS) {
           audioResetFlags();
-          target = (DemoTarget)random(0, 3);
+          target = (DemoTarget)random(0, 4);
           setTargetLEDs(target);
           demo_phase = DEMO_ON;
           phase_t0 = nowMs;
@@ -1103,8 +1228,9 @@ void loop() {
           guard_rearm_until = nowMs + GUARD_REARM_MS;
           sA.vx_pb = 0; sA.pbx *= 0.5f;
           sB.vx_pb = 0; sB.pbx *= 0.5f;
-          prevPunchA = prevPunchB = prevGuard = false;
-
+          prevPunchA = prevPunchB = prevGuard = prevDodge = false;
+          resetDodge(nowMs);
+          zeroY(sA); zeroY(sB);
           // compute planned base for *this* round so that at ~round 50 we hit the floor
           double planned = (double)ON_MS_START * pow((double)ON_SPEEDUP, (double)rounds);
           if (planned < (double)ON_MS_MIN) planned = (double)ON_MS_MIN;
@@ -1114,12 +1240,11 @@ void loop() {
         break;
 
       case DEMO_DONE: {
-        delay(300);
-        if (!au_donePlayed) { playClip(7); au_donePlayed = true; }
+        if (!au_donePlayed) { delay(3000); playClip(7); au_donePlayed = true; }
         if (game_over) {
-          if (!au_gameoverPlayed) { playClip(8); au_gameoverPlayed = true; }
+          if (!au_gameoverPlayed) { delay(3000); playClip(8); au_gameoverPlayed = true; }
         } else {
-          if (!au_finishedPlayed) { playClip(9); au_finishedPlayed = true; }
+          if (!au_finishedPlayed) { delay(3000); playClip(9); au_finishedPlayed = true; }
         }
       } break;
       default: break;
