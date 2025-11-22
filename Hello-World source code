@@ -97,7 +97,6 @@ const float ABS_POS_OFF_M = 0.05f;  // 5 cm to release (hysteresis)
 const float PB_POS_ON_M  = 0.025f;   // ~2.5 cm to trigger guard 
 const float PB_POS_OFF_M = 0.015f;   // ~1.5 cm to release 
 
-// Add near the top with other config:
 const uint16_t GUARD_REARM_MS = 120;   // refractory after guard releases
 unsigned long guard_rearm_until = 0;
 
@@ -171,7 +170,6 @@ const float GUARD_COS_ALPHA = 0.80f;  // LPF on cos(angle)
 
 const float GUARD_PB_BLEED = 0.80f;   // 0.75→0.80: slower decay while guard_on
 
-// Add to globals:
 const uint16_t GUARD_MAX_HOLD_MS = 700; // tune 600–900 ms
 static unsigned long tGuardOn = 0;
 
@@ -653,7 +651,7 @@ void guard(GravState &sa, GravState &sb,
   // Basic displacement condition (hands pulled back enough)
   bool bothBehind = (sa.pbx <= -PB_POS_ON_M) && (sb.pbx <= -PB_POS_ON_M);
 
-  // If not latched, see if we can latch now
+  // If not latched, see if can latch now
   if (!guard_on) {
     if (bothBackRecent && bothBehind) {
       guard_on = true;
@@ -663,7 +661,7 @@ void guard(GravState &sa, GravState &sb,
       sa.vx *= 0.2f; sa.px *= 0.3f;
       sb.vx *= 0.2f; sb.px *= 0.3f;
 
-      // also shrink lateral state so it doesn't turn into a dodge later
+      // shrink lateral state so it doesn't turn into a dodge later
       sa.vy *= 0.3f; sa.py *= 0.3f;
       sb.vy *= 0.3f; sb.py *= 0.3f;
     }
@@ -703,7 +701,7 @@ static inline bool sameSign(float a, float b, float eps) {
   return (a > 0 && b > 0) || (a < 0 && b < 0);
 }
 
-// Latch when both |py| >= ON and same sign; add rearm + timeout + bleed
+// Latch when both |py| >= ON and same sign, rearm + timeout + bleed
 static inline void updateDodge(GravState &sa, GravState &sb, unsigned long now) {
   // If punch or guard is active, dodge is disabled
   if (sa.punch_on || sb.punch_on || guard_on) {
@@ -1087,10 +1085,6 @@ void setup() {
   hA.healthy = okA; hB.healthy = okB;
   hA.failCount = okA ? 0 : HEALTH_FAIL_LIMIT;
   hB.failCount = okB ? 0 : HEALTH_FAIL_LIMIT;
-
-  // NOTE: do NOT seed here anymore — we seed on Start button
-  // if (hA.healthy) seedGravity(...);
-  // if (hB.healthy) seedGravity(...);
 
   // Serial.println("Press START to begin (3-2-1-0 then seed).");
   delay(100);
